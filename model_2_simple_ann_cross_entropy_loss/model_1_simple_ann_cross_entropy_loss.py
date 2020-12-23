@@ -7,17 +7,23 @@ import torch.nn as nn
 import fire
 
 
+def is_match(z, y):
+    if float(z) * float(y):
+        pass
+
 def main(
     validation_size=1000,
     nrows=10000,
-    dropout_p=0.3,
+    skiprows=10000,
+    dropout_p=0.15,
     batch_size=100,
-    n_epoch=3,
-    validation_results_count=20,
-    big_number=100,
-    small_number=20,
+    n_epoch=10,
+    validation_results_count=200,
+    big_number=300,
+    small_number=60,
     lr=0.1,
 ):
+    assert validation_results_count < validation_size
     writer = SummaryWriter()
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print(device)
@@ -25,13 +31,11 @@ def main(
     df = pd.read_csv(
         "/home/vaclavmatejka/devel/janestreet/jane-street-market-prediction/train.csv",
         nrows=nrows,
+        #skiprows=skiprows,
     )
     df = df.fillna(0)
-    df["resp"] = df["resp"] * 10000
-    df["resp_1"] = df["resp_1"] * 10000
-    df["resp_2"] = df["resp_2"] * 10000
-    df["resp_3"] = df["resp_3"] * 10000
-    df["resp_4"] = df["resp_4"] * 10000
+    df.loc[df["resp"] <= 0, "trade"] = 0
+    df.loc[df["resp"] > 0, "trade"] = 1
 
     class JaneStreetDataset(Dataset):
 
@@ -45,8 +49,8 @@ def main(
         def __getitem__(self, index):
             sample = (
                 torch.from_numpy(self.df.iloc[index]["feature_0":"feature_129"].values),
-                # torch.tensor(self.df.iloc[index]["big_resp"]),
-                torch.from_numpy(self.df.iloc[index]["resp_1":"resp"].values),
+                torch.tensor(self.df.iloc[index]["trade"]),
+                # torch.from_numpy(self.df.iloc[index]["trade"]),
             )
             sample = sample[0].to(device), sample[1].to(device)
             if self.transform:
@@ -78,7 +82,7 @@ def main(
         nn.Dropout(p=dropout_p),
         torch.nn.ReLU(),
         nn.BatchNorm1d(small_number),
-        torch.nn.Linear(small_number, 5),
+        torch.nn.Linear(small_number, 1),
     )
 
     def init_weights(m):
@@ -99,7 +103,7 @@ def main(
 
     model = model.float()
     model.to(device)
-    criterion = nn.MSELoss()
+    criterion = nn.BCEWithLogitsLoss()
 
     def train_model(
         model,
@@ -109,8 +113,8 @@ def main(
         n_epoch=None,
         lr=0.01,
     ):
-        # optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-        optimizer = torch.optim.SGD(model.parameters(), lr=lr / 10, momentum=lr / 10)
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        # optimizer = torch.optim.SGD(model.parameters(), lr=lr / 10, momentum=lr / 10)
         accuracy_list = {}
         loss_list = {}
         for epoch in range(n_epoch):
@@ -118,8 +122,8 @@ def main(
                 model.train()
                 optimizer.zero_grad()
                 z = model(x.float())
-                # y = y.view(-1, 1).float()
-                y = y.float()
+                y = y.view(-1, 1).float()
+                # y = y.float()
                 loss = criterion(z, y)
                 writer.add_scalar("Train data", loss, epoch)
                 loss.backward()
@@ -131,9 +135,9 @@ def main(
             for x_test, y_test in validation_loader:
                 model.eval()
                 z = model(x_test.float())
-                #z = torch.zeros((100, 5)).to(device)
-                # y = y.view(-1, 1)
-                y = y.float()
+                # z = torch.zeros((100, 5)).to(device)
+                y = y.view(-1, 1)
+                # y = y.float()
                 loss = criterion(z, y.float())
                 writer.add_scalar("Validation data", loss, epoch)
                 if not accuracy_list.get(epoch):
@@ -153,14 +157,17 @@ def main(
     # print("Variance of last epoch loss {}".format(np.var(accuracy_list[n_epoch-1])))
     # print("Mean of last epoch loss {}".format(np.mean(accuracy_list[n_epoch - 1])))
     model.eval()
-
+    acc_count = 0
+    total_count = 0
+    total_buy_signals = 0
+    near_zeros = 0
     for one in range(validation_results_count):
         index = np.random.randint(nrows - validation_size + 1, nrows - 1)
         # a = torch.from_numpy(df.iloc[index]["feature_0":"feature_129"].values)
         if df.iloc[index]["weight"] < 0.00001:
             continue
         a = df.iloc[index]["feature_0":"feature_129"].values
-        resp = torch.tensor(df.iloc[index]["resp"])
+        trade = torch.tensor(df.iloc[index]["trade"])
 
         r = []
         for one in range(batch_size):
@@ -169,7 +176,19 @@ def main(
         model_input = torch.from_numpy(r).float().to(device)
         z = model(model_input)
 
-        print(float(resp), float(z[0][4]))
+        if float(z[0]) < 0.01 and float(z[0]) > -0.01:
+            near_zeros +=1
+
+        if trade == 0:
+            trade = -1
+        else:
+            total_buy_signals += 1
+        if (float(trade) * float(z[0])) > 0:
+            acc_count += 1
+        total_count += 1
+    print("Accuracy is {}".format(acc_count / total_count))
+    print("Buy signals {}".format(total_buy_signals / total_count))
+    print("Near zeros {}".format(near_zeros / total_count))
 
 
 if __name__ == "__main__":
