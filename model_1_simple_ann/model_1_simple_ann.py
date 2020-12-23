@@ -10,12 +10,13 @@ import fire
 def main(
     validation_size=1000,
     nrows=10000,
-    dropout_p=0.0,
+    dropout_p=0.3,
     batch_size=100,
-    n_epoch=10,
+    n_epoch=50,
     validation_results_count=20,
-    big_number=100,
-    small_number=20,
+    big_number=1000,
+    small_number=1000,
+    lr=0.1,
 ):
     writer = SummaryWriter()
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -26,7 +27,11 @@ def main(
         nrows=nrows,
     )
     df = df.fillna(0)
-    df["big_resp"] = df["resp"] * 10000
+    df["resp"] = df["resp"] * 10000
+    df["resp_1"] = df["resp_1"] * 10000
+    df["resp_2"] = df["resp_2"] * 10000
+    df["resp_3"] = df["resp_3"] * 10000
+    df["resp_4"] = df["resp_4"] * 10000
 
     class JaneStreetDataset(Dataset):
 
@@ -40,7 +45,8 @@ def main(
         def __getitem__(self, index):
             sample = (
                 torch.from_numpy(self.df.iloc[index]["feature_0":"feature_129"].values),
-                torch.tensor(self.df.iloc[index]["big_resp"]),
+                # torch.tensor(self.df.iloc[index]["big_resp"]),
+                torch.from_numpy(self.df.iloc[index]["resp_1":"resp"].values),
             )
             sample = sample[0].to(device), sample[1].to(device)
             if self.transform:
@@ -72,12 +78,12 @@ def main(
         nn.Dropout(p=dropout_p),
         torch.nn.ReLU(),
         nn.BatchNorm1d(small_number),
-        torch.nn.Linear(small_number, 1),
+        torch.nn.Linear(small_number, 5),
     )
 
     def init_weights(m):
         if type(m) == nn.Linear:
-            torch.nn.init.xavier_uniform(m.weight)
+            torch.nn.init.xavier_uniform_(m.weight)
             m.bias.data.fill_(0.01)
 
     model.apply(init_weights)
@@ -93,21 +99,35 @@ def main(
 
     model = model.float()
     model.to(device)
-    # optimizer = torch.optim.Adam(model.parameters(), lr=LR)
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.001, momentum=0.001)
     criterion = nn.MSELoss()
 
     def train_model(
-        model, train_loader, validation_loader, optimizer, criterion, n_epoch=None
+        model,
+        train_loader,
+        validation_loader,
+        criterion,
+        n_epoch=None,
+        lr=0.01,
     ):
+        # optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        optimizer = torch.optim.SGD(model.parameters(), lr=lr / 10, momentum=lr / 10)
         accuracy_list = {}
         loss_list = {}
         for epoch in range(n_epoch):
+            if epoch == 20:
+                optimizer = torch.optim.SGD(
+                    model.parameters(), lr=lr / 50, momentum=lr / 50
+                )
+            if epoch == 40:
+                optimizer = torch.optim.SGD(
+                    model.parameters(), lr=lr / 200, momentum=lr / 200
+                )
             for x, y in train_loader:
                 model.train()
                 optimizer.zero_grad()
                 z = model(x.float())
-                y = y.view(-1, 1).float()
+                # y = y.view(-1, 1).float()
+                y = y.float()
                 loss = criterion(z, y)
                 writer.add_scalar("Train data", loss, epoch)
                 loss.backward()
@@ -119,7 +139,8 @@ def main(
             for x_test, y_test in validation_loader:
                 model.eval()
                 z = model(x_test.float())
-                y = y.view(-1, 1)
+                # y = y.view(-1, 1)
+                y = y.float()
                 loss = criterion(z, y.float())
                 writer.add_scalar("Validation data", loss, epoch)
                 if not accuracy_list.get(epoch):
@@ -128,17 +149,25 @@ def main(
         return accuracy_list, loss_list
 
     accuracy_list, loss_list = train_model(
-        model, train_loader, validation_loader, optimizer, criterion, n_epoch=n_epoch
+        model,
+        train_loader,
+        validation_loader,
+        criterion,
+        n_epoch=n_epoch,
+        lr=lr,
     )
-    print(accuracy_list[n_epoch-1])
-
+    print(accuracy_list[n_epoch - 1])
+    # print("Variance of last epoch loss {}".format(np.var(accuracy_list[n_epoch-1])))
+    # print("Mean of last epoch loss {}".format(np.mean(accuracy_list[n_epoch - 1])))
     model.eval()
 
     for one in range(validation_results_count):
         index = np.random.randint(nrows - validation_size + 1, nrows - 1)
         # a = torch.from_numpy(df.iloc[index]["feature_0":"feature_129"].values)
+        if df.iloc[index]["weight"] < 0.00001:
+            continue
         a = df.iloc[index]["feature_0":"feature_129"].values
-        resp = torch.tensor(df.iloc[index]["big_resp"])
+        resp = torch.tensor(df.iloc[index]["resp"])
 
         r = []
         for one in range(batch_size):
@@ -147,7 +176,7 @@ def main(
         model_input = torch.from_numpy(r).float().to(device)
         z = model(model_input)
 
-        print(float(resp), float(z[0]))
+        print(float(resp), float(z[0][4]))
 
 
 if __name__ == "__main__":
