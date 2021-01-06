@@ -136,9 +136,9 @@ def main(
                 model.eval()
                 z = model(x_test.float())
                 # z = torch.zeros((100, 5)).to(device)
-                y = y.view(-1, 1)
+                y_test = y_test.view(-1, 1)
                 # y = y.float()
-                loss = criterion(z, y.float())
+                loss = criterion(z, y_test.float())
                 writer.add_scalar("Validation data", loss, epoch)
                 if not accuracy_list.get(epoch):
                     accuracy_list[epoch] = []
