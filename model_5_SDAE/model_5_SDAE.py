@@ -6,7 +6,10 @@ from torch.utils.tensorboard import SummaryWriter
 import torch.nn as nn
 import fire
 
-# WRONG - second layer is just trained with noisy data - but against original input
+CSV_PATH = (
+    "/home/vaclavmatejka/devel/janestreet/jane-street-market-prediction/train.csv"
+)
+
 
 class JaneStreetEncode1Dataset(Dataset):
 
@@ -18,9 +21,9 @@ class JaneStreetEncode1Dataset(Dataset):
         self.device = device
 
     def add_noise(self, inputs):
-        # noise = torch.randn_like(inputs)
-        noise = inputs.clone().uniform_(-1, 1)
-        noise = noise.multiply(1 / 8)
+        noise = torch.randn_like(inputs)
+        # noise = inputs.clone().uniform_(-1, 1)
+        noise = noise.multiply(1 / 16)
         return inputs + noise
 
     # Getter
@@ -44,56 +47,46 @@ class JaneStreetEncode1Dataset(Dataset):
 class JaneStreetEncode2Dataset(Dataset):
 
     # Constructor with defult values
-    def __init__(self, df, device, encoded_layer, transform=None):
-        self.df = df
-        self.len = len(self.df)
+    def __init__(
+        self,
+        encoded_layer,
+        device,
+        transform=None,
+        noise_type=None,
+        noise_multiplicator=None,
+        noise_dropout=None,
+    ):
+        self.encoded_layer = encoded_layer
+        self.len = len(encoded_layer)
         self.transform = transform
         self.device = device
-        self.encoded_layer = encoded_layer
+        self.noise_type = noise_type
+        self.noise_multiplicator = noise_multiplicator
+        self.noise_dropout = noise_dropout
 
     def add_noise(self, inputs):
-        noise = torch.randn_like(inputs)
-        # noise = inputs.clone().uniform_()
-        noise = noise.multiply(1 / 16)
+        assert self.noise_multiplicator
+        assert self.noise_dropout is not None
+        dropout_model = nn.Dropout(p=self.noise_dropout)
+        if self.noise_type == "G":
+            noise = torch.randn_like(inputs)
+        elif self.noise_type == "U":
+            noise = inputs.clone().uniform_()
+        elif self.noise_type == "A":
+            multiplier = 1 + np.random.randint(-3, 3) / 100  # from 0.97 to 1.03
+            inputs = inputs.multiply(multiplier)
+            return inputs
+        else:
+            raise Exception("Unknown noise")
+        noise = dropout_model(noise)
+        noise = noise.multiply(self.noise_multiplicator)
         return inputs + noise
 
     # Getter
     def __getitem__(self, index):
         sample = (
             self.add_noise(torch.from_numpy(self.encoded_layer[index])),
-            torch.from_numpy(self.df.iloc[index]["feature_0":"feature_129"].values),
-        )
-        sample = sample[0].to(self.device), sample[1].to(self.device)
-        if self.transform:
-            sample = self.transform(sample)
-        return sample
-
-    # Get Length
-    def __len__(self):
-        return self.len
-
-
-class JaneStreetEncode3Dataset(Dataset):
-
-    # Constructor with defult values
-    def __init__(self, df, device, transform=None):
-        self.df = df
-        self.len = len(self.df)
-        self.transform = transform
-        self.device = device
-
-    def add_noise(self, inputs):
-        noise = torch.randn_like(inputs)
-        noise = noise.multiply(1 / 8)
-        return inputs + noise
-
-    # Getter
-    def __getitem__(self, index):
-        sample = (
-            self.add_noise(
-                torch.from_numpy(self.df.iloc[index]["feature_0":"feature_129"].values)
-            ),
-            torch.from_numpy(self.df.iloc[index]["feature_0":"feature_129"].values),
+            torch.from_numpy(self.encoded_layer[index]),
         )
         sample = sample[0].to(self.device), sample[1].to(self.device)
         if self.transform:
@@ -151,9 +144,10 @@ def train_model(
 ):
     writer = SummaryWriter()
     # criterion = nn.MSELoss()
-    criterion = nn.L1Loss()
+    # criterion = nn.L1Loss()
+    criterion = nn.SmoothL1Loss()
     # optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=lr)
+    optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=lr / 3)
     accuracy_list = {}
     loss_list = {}
     for epoch in range(n_epoch):
@@ -227,6 +221,24 @@ def visual_control(
     print(z[0][:20])
 
 
+def print_losses(accuracy_list, n_epoch, phase):
+    print("phase {}".format(phase))
+    print(
+        "validation loss mean: {} {} {}".format(
+            np.mean(accuracy_list[1]),
+            np.mean(accuracy_list[int(n_epoch / 2)]),
+            np.mean(accuracy_list[n_epoch - 1]),
+        )
+    )
+    print(
+        "validation loss variance: {} {} {}".format(
+            np.var(accuracy_list[1]),
+            np.var(accuracy_list[int(n_epoch / 2)]),
+            np.var(accuracy_list[n_epoch - 1]),
+        )
+    )
+
+
 def main(
     nrows=400000,
     big_number=500,
@@ -234,14 +246,15 @@ def main(
     dropout_p=0.15,
     validation_size=40000,
     batch_size=200,
-    n_epoch=100,
+    n_epoch=25,
     lr=0.15,
 ):
+    assert torch.cuda.is_available()
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     df = pd.read_csv(
-        "/home/vaclavmatejka/devel/janestreet/jane-street-market-prediction/train.csv",
+        CSV_PATH,
         nrows=nrows,
-        skiprows=range(1, 500000),
+        # skiprows=range(1, 500000),
     )
     df = df.fillna(0)
     df = df.multiply(1)
@@ -292,11 +305,21 @@ def main(
     assert len(train_encoded_layer1) == len(janestreet1_train)
     assert len(validation_encoded_layer1) == len(janestreet1_validation)
 
+    print_losses(accuracy_list, n_epoch, 1)
+
     janestreet2_train = JaneStreetEncode2Dataset(
-        df=train_sample, device=device, encoded_layer=train_encoded_layer1
+        encoded_layer=train_encoded_layer1,
+        device=device,
+        noise_type="U",
+        noise_multiplicator=1 / 16,
+        noise_dropout=0.0,
     )
     janestreet2_validation = JaneStreetEncode2Dataset(
-        df=validation_sample, device=device, encoded_layer=validation_encoded_layer1
+        encoded_layer=validation_encoded_layer1,
+        device=device,
+        noise_type="U",
+        noise_multiplicator=1 / 16,
+        noise_dropout=0.0,
     )
     train_loader2 = torch.utils.data.DataLoader(
         dataset=janestreet2_train, batch_size=batch_size, drop_last=True
@@ -309,8 +332,8 @@ def main(
         big_number=big_number,
         dropout_p=dropout_p,
         input_size=60,
-        output_size=130,
-        bottleneck=60,
+        output_size=60,
+        bottleneck=55,
     )
     model2 = model2.float()
     model2.to(device)
@@ -333,28 +356,69 @@ def main(
     assert len(train_encoded_layer2) == len(janestreet2_train)
     assert len(validation_encoded_layer2) == len(janestreet2_validation)
 
-    print("start")
-    print("validation loss mean: {}".format(np.mean(accuracy_list[1])))
-    print("validation loss variance: {}".format(np.var(accuracy_list[1])))
+    print_losses(accuracy_list, n_epoch, 2)
 
-    print("mid")
-    print("validation loss mean: {}".format(np.mean(accuracy_list[int(n_epoch / 2)])))
-    print(
-        "validation loss variance: {}".format(np.var(accuracy_list[int(n_epoch / 2)]))
+    janestreet3_train = JaneStreetEncode2Dataset(
+        encoded_layer=train_encoded_layer2,
+        device=device,
+        noise_type="A",
+        noise_multiplicator=1 / 32,
+        noise_dropout=0.0,
+    )
+    janestreet3_validation = JaneStreetEncode2Dataset(
+        encoded_layer=validation_encoded_layer2,
+        device=device,
+        noise_type="A",
+        noise_multiplicator=1 / 32,
+        noise_dropout=0.0,
+    )
+    train_loader3 = torch.utils.data.DataLoader(
+        dataset=janestreet3_train, batch_size=batch_size, drop_last=True
+    )
+    validation_loader3 = torch.utils.data.DataLoader(
+        dataset=janestreet3_validation, batch_size=batch_size, drop_last=True
     )
 
-    print("end")
-    print("validation loss mean: {}".format(np.mean(accuracy_list[n_epoch - 1])))
-    print("validation loss variance: {}".format(np.var(accuracy_list[n_epoch - 1])))
+    model3 = autoencoder(
+        small_number=small_number,
+        big_number=big_number,
+        dropout_p=dropout_p,
+        input_size=55,
+        output_size=55,
+        bottleneck=50,
+    )
+    model3 = model3.float()
+    model3.to(device)
+
+    train_res = train_model(
+        model3,
+        train_loader3,
+        validation_loader3,
+        n_epoch=n_epoch,
+        lr=lr,
+        device=device,
+        phase=3,
+    )
+    (
+        accuracy_list,
+        loss_list,
+        train_encoded_layer3,
+        validation_encoded_layer3,
+    ) = train_res
+
+    assert len(train_encoded_layer3) == len(janestreet3_train)
+    assert len(validation_encoded_layer3) == len(janestreet3_validation)
+
+    print_losses(accuracy_list, n_epoch, 3)
 
     visual_control(
-        model2,
+        model3,
         nrows,
         validation_size,
         batch_size,
         device,
-        janestreet2_validation.df,
-        validation_encoded_layer1,
+        validation_sample,
+        validation_encoded_layer2,
     )
 
     print("Done")
