@@ -5,10 +5,49 @@ from torch.utils.data import Dataset
 from torch.utils.tensorboard import SummaryWriter
 import torch.nn as nn
 import fire
+from torch import Tensor
 
 CSV_PATH = (
     "/home/vaclavmatejka/devel/janestreet/jane-street-market-prediction/train.csv"
 )
+
+
+def extract_model_input(df, batch_size, device, e1, e2, e3, encoded_features_count=50):
+    base_culumns = ["date", "weight", "resp_1", "resp_2", "resp_3", "resp_4", "resp"]
+    encoded_columns = []
+    original_columns = []
+    for one in range(encoded_features_count):
+        encoded_columns.append("enc_feature_{}".format(one))
+
+    for one in range(130):
+        original_columns.append("feature_{}".format(one))
+
+    def append_to_df(new_df, source_df_row, encoded_layer):
+        row_dict = {}
+        for column_name in base_culumns:
+            row_dict[column_name] = source_df_row[column_name]
+        for column_name in original_columns:
+            row_dict[column_name] = source_df_row[column_name]
+        index = 0
+        for one in encoded_layer:
+            row_dict[encoded_columns[index]] = one
+            index += 1
+        new_df = new_df.append(row_dict, ignore_index=True)
+        return new_df
+
+    new_df = pd.DataFrame(columns=base_culumns + encoded_columns + original_columns)
+    for index, row in df.iterrows():
+        a = row["feature_0":"feature_129"].values
+        r = []
+        for one in range(batch_size):
+            r.append(a)
+        r = np.array(r)
+        model_input = torch.from_numpy(r).float().to(device)
+        z = e1.encoder(model_input)
+        z = e2.encoder(z)
+        z = e3.encoder(z)
+        new_df = append_to_df(new_df, row, z[0].cpu().detach().numpy())
+    new_df.to_csv("encoded.csv")
 
 
 class JaneStreetDataset(Dataset):
@@ -58,30 +97,48 @@ class JaneStreetDataset(Dataset):
         return self.len
 
 
-class JaneStreetEncode1Dataset(Dataset):
-
-    # Constructor with defult values
-    def __init__(self, df, device, transform=None):
-        self.df = df
-        self.len = len(self.df)
-        self.transform = transform
-        self.device = device
+class AddNoiseMixin:
+    def init_dropout(self):
+        self.dropout_model = nn.Dropout(p=0.5)
 
     def add_noise(self, inputs):
         noise = torch.randn_like(inputs)
         # noise = inputs.clone().uniform_(-1, 1)
+
+        mask = torch.ones_like(inputs)
+        mask = self.dropout_model(mask)
+
         noise = noise.multiply(1 / 16)
-        return inputs + noise
+        noise = noise * mask
+        return inputs + noise, mask
+
+
+class JaneStreetEncode1Dataset(AddNoiseMixin, Dataset):
+
+    # Constructor with defult values
+    def __init__(self, df, device, transform=None):
+        self.init_dropout()
+        self.df = df
+        self.len = len(self.df)
+        self.transform = transform
+        self.device = device
+        self.dropout_model = nn.Dropout(p=0.5)
 
     # Getter
     def __getitem__(self, index):
-        sample = (
-            self.add_noise(
-                torch.from_numpy(self.df.iloc[index]["feature_0":"feature_129"].values)
-            ),
-            torch.from_numpy(self.df.iloc[index]["feature_0":"feature_129"].values),
+        inputs, mask = self.add_noise(
+            torch.from_numpy(self.df.iloc[index]["feature_0":"feature_129"].values)
         )
-        sample = sample[0].to(self.device), sample[1].to(self.device)
+        sample = (
+            inputs,
+            torch.from_numpy(self.df.iloc[index]["feature_0":"feature_129"].values),
+            mask,
+        )
+        sample = (
+            sample[0].to(self.device),
+            sample[1].to(self.device),
+            sample[2].to(self.device),
+        )
         if self.transform:
             sample = self.transform(sample)
         return sample
@@ -91,7 +148,7 @@ class JaneStreetEncode1Dataset(Dataset):
         return self.len
 
 
-class JaneStreetEncode2Dataset(Dataset):
+class JaneStreetEncode2Dataset(AddNoiseMixin, Dataset):
 
     # Constructor with defult values
     def __init__(
@@ -103,6 +160,7 @@ class JaneStreetEncode2Dataset(Dataset):
         noise_multiplicator=None,
         noise_dropout=None,
     ):
+        self.init_dropout()
         self.encoded_layer = encoded_layer
         self.len = len(encoded_layer)
         self.transform = transform
@@ -110,11 +168,11 @@ class JaneStreetEncode2Dataset(Dataset):
         self.noise_type = noise_type
         self.noise_multiplicator = noise_multiplicator
         self.noise_dropout = noise_dropout
+        self.noise_dropout = nn.Dropout(p=self.noise_dropout)
 
-    def add_noise(self, inputs):
+    def add_noise2(self, inputs):
         assert self.noise_multiplicator
         assert self.noise_dropout is not None
-        dropout_model = nn.Dropout(p=self.noise_dropout)
         if self.noise_type == "G":
             noise = torch.randn_like(inputs)
         elif self.noise_type == "U":
@@ -123,19 +181,27 @@ class JaneStreetEncode2Dataset(Dataset):
             multiplier = 1 + np.random.randint(-3, 3) / 100  # from 0.97 to 1.03
             inputs = inputs.multiply(multiplier)
             return inputs
+        elif self.noise_dropout:
+            inputs = self.noise_dropout(inputs)
+            return inputs
         else:
             raise Exception("Unknown noise")
-        noise = dropout_model(noise)
         noise = noise.multiply(self.noise_multiplicator)
-        return inputs + noise
+        mask = torch.ones_like(inputs)
+        mask = self.dropout_model(mask)
+        noise = noise * mask
+        inputs = inputs + noise
+        return inputs, mask
 
     # Getter
     def __getitem__(self, index):
+        inputs, mask = self.add_noise(torch.from_numpy(self.encoded_layer[index]))
+        sample = (inputs, torch.from_numpy(self.encoded_layer[index]), mask)
         sample = (
-            self.add_noise(torch.from_numpy(self.encoded_layer[index])),
-            torch.from_numpy(self.encoded_layer[index]),
+            sample[0].to(self.device),
+            sample[1].to(self.device),
+            sample[2].to(self.device),
         )
-        sample = sample[0].to(self.device), sample[1].to(self.device)
         if self.transform:
             sample = self.transform(sample)
         return sample
@@ -205,6 +271,24 @@ class classifier(nn.Module):
         return x
 
 
+class MaskedSmoothL1Loss(nn.SmoothL1Loss):
+    def __init__(
+        self, size_average=None, reduce=None, reduction: str = "mean", beta: float = 1.0
+    ) -> None:
+        super().__init__(size_average, reduce, reduction, beta)
+
+        self.alfa = 0.7  # corrupted weight
+        self.beta = 0.3  # not corrupted weight
+
+    def forward(self, input: Tensor, target: Tensor, mask: Tensor) -> Tensor:
+        # mask = zeros means corrupted
+        reversed_mask = ~mask  # zeros means legit
+        legit_input = torch.masked_select(input, mask)
+        corrupt_input = torch.masked_select(input, reversed_mask)
+        ret = super().forward(input, target)
+        return ret
+
+
 def train_model_classification(
     model,
     train_loader,
@@ -218,11 +302,10 @@ def train_model_classification(
     writer = SummaryWriter()
     # criterion = nn.MSELoss()
     # criterion = nn.L1Loss()
-    if criterion is None:
-        criterion = nn.SmoothL1Loss()
+    criterion = nn.SmoothL1Loss()
     # optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    # optimizer = torch.optim.SGD(model.parameters(), lr=lr / 5, momentum=lr / 15)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+    optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=lr)
+    # optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
     accuracy_list = {}
     loss_list = {}
     for epoch in range(n_epoch):
@@ -275,14 +358,13 @@ def train_model(
     writer = SummaryWriter()
     # criterion = nn.MSELoss()
     # criterion = nn.L1Loss()
-    if criterion is None:
-        criterion = nn.SmoothL1Loss()
+    criterion = nn.SmoothL1Loss()
     # optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=lr)
     accuracy_list = {}
     loss_list = {}
     for epoch in range(n_epoch):
-        for x, y in train_loader:
+        for x, y, mask in train_loader:
             model.train()
             optimizer.zero_grad()
             z = model(x.float())
@@ -296,7 +378,7 @@ def train_model(
                 loss_list[epoch] = []
             loss_list[epoch].append(loss.data.tolist())
         # perform a prediction on the validation data
-        for x_test, y_test in validation_loader:
+        for x_test, y_test, mask_test in validation_loader:
             model.eval()
             z = model(x_test.float())
             # z = torch.zeros((100, 130)).to(device)
@@ -314,7 +396,7 @@ def train_model(
 
     def build_encoded_layer(loader):
         encoded_layer = []
-        for x, y in loader:
+        for x, y, mask in loader:
             z = model.encoder(x.float())
             for row in z.cpu().detach().numpy():
                 encoded_layer.append(row)
@@ -435,7 +517,7 @@ def main(
     df = pd.read_csv(
         CSV_PATH,
         nrows=nrows,
-        skiprows=range(1, 500000),
+        # skiprows=range(1, 500000),
     )
     df = df.fillna(0)
     df = df.multiply(1)
@@ -491,16 +573,16 @@ def main(
     janestreet2_train = JaneStreetEncode2Dataset(
         encoded_layer=train_encoded_layer1,
         device=device,
-        noise_type="U",
+        noise_type=None,
         noise_multiplicator=1 / 16,
-        noise_dropout=0.0,
+        noise_dropout=0.2,
     )
     janestreet2_validation = JaneStreetEncode2Dataset(
         encoded_layer=validation_encoded_layer1,
         device=device,
-        noise_type="U",
+        noise_type=None,
         noise_multiplicator=1 / 16,
-        noise_dropout=0.0,
+        noise_dropout=0.2,
     )
     train_loader2 = torch.utils.data.DataLoader(
         dataset=janestreet2_train, batch_size=batch_size, drop_last=True
@@ -592,60 +674,27 @@ def main(
 
     print_losses(accuracy_list, n_epoch, 3)
 
-
+    visual_control(
+        model3,
+        nrows,
+        validation_size,
+        batch_size,
+        device,
+        validation_sample,
+        validation_encoded_layer2,
+    )
 
     return
 
-    janestreet_classifier_train = JaneStreetDataset(
-        df=train_sample,
-        device=device,
-        e1=model1,
-        e2=model2,
-        e3=model3,
-        batch_size=batch_size,
+    df = pd.read_csv(
+        CSV_PATH,
+        nrows=100,
+        # skiprows=range(1, 500000),
     )
-    janestreet_classifier_validation = JaneStreetDataset(
-        df=validation_sample,
-        device=device,
-        e1=model1,
-        e2=model2,
-        e3=model3,
-        batch_size=batch_size,
+    df = df.fillna(0)
+    extract_model_input(
+        df, batch_size, device, model1, model2, model3, encoded_features_count=50
     )
-    train_classifier_loader = torch.utils.data.DataLoader(
-        dataset=janestreet_classifier_train, batch_size=batch_size, drop_last=True
-    )
-    validation_classifier_loader = torch.utils.data.DataLoader(
-        dataset=janestreet_classifier_validation, batch_size=batch_size, drop_last=True
-    )
-
-    model_classifier = classifier(
-        small_number=int(small_number), big_number=big_number, dropout_p=dropout_p
-    )
-
-    model_classifier = model_classifier.float()
-    model_classifier.to(device)
-
-    criterion = nn.BCEWithLogitsLoss()
-    train_res = train_model_classification(
-        model_classifier,
-        train_classifier_loader,
-        validation_classifier_loader,
-        n_epoch=n_epoch,
-        lr=lr,
-        device=device,
-        phase=4,
-        criterion=criterion,
-    )
-    (
-        accuracy_list,
-        loss_list,
-        train_encoded_layer3,
-        validation_encoded_layer3,
-    ) = train_res
-
-    print_losses(accuracy_list, n_epoch, 4)
-
     print("Done")
 
 
