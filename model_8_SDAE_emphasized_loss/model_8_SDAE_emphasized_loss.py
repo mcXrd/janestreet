@@ -12,44 +12,6 @@ CSV_PATH = (
 )
 
 
-def extract_model_input(df, batch_size, device, e1, e2, e3, encoded_features_count=50):
-    base_culumns = ["date", "weight", "resp_1", "resp_2", "resp_3", "resp_4", "resp"]
-    encoded_columns = []
-    original_columns = []
-    for one in range(encoded_features_count):
-        encoded_columns.append("enc_feature_{}".format(one))
-
-    for one in range(130):
-        original_columns.append("feature_{}".format(one))
-
-    def append_to_df(new_df, source_df_row, encoded_layer):
-        row_dict = {}
-        for column_name in base_culumns:
-            row_dict[column_name] = source_df_row[column_name]
-        for column_name in original_columns:
-            row_dict[column_name] = source_df_row[column_name]
-        index = 0
-        for one in encoded_layer:
-            row_dict[encoded_columns[index]] = one
-            index += 1
-        new_df = new_df.append(row_dict, ignore_index=True)
-        return new_df
-
-    new_df = pd.DataFrame(columns=base_culumns + encoded_columns + original_columns)
-    for index, row in df.iterrows():
-        a = row["feature_0":"feature_129"].values
-        r = []
-        for one in range(batch_size):
-            r.append(a)
-        r = np.array(r)
-        model_input = torch.from_numpy(r).float().to(device)
-        z = e1.encoder(model_input)
-        z = e2.encoder(z)
-        z = e3.encoder(z)
-        new_df = append_to_df(new_df, row, z[0].cpu().detach().numpy())
-    new_df.to_csv("encoded.csv")
-
-
 class JaneStreetDataset(Dataset):
 
     # Constructor with defult values
@@ -99,18 +61,22 @@ class JaneStreetDataset(Dataset):
 
 class AddNoiseMixin:
     def init_dropout(self):
-        self.dropout_model = nn.Dropout(p=0.5)
+        self.dropout_model = nn.Dropout(p=0.2)
 
-    def add_noise(self, inputs):
-        noise = torch.randn_like(inputs)
-        # noise = inputs.clone().uniform_(-1, 1)
-
+    def get_mask(self, inputs):
         mask = torch.ones_like(inputs)
         mask = self.dropout_model(mask)
+        mask[mask != 0] = 1
+        return mask
 
-        noise = noise.multiply(1 / 16)
-        noise = noise * mask
-        return inputs + noise, mask
+    def add_noise(self, inputs):
+        # noise = torch.randn_like(inputs)
+        # noise = inputs.clone().uniform_(-1, 1)
+        mask = self.get_mask(inputs)
+        # noise = noise.multiply(1 / 16)
+        # noise = noise * mask
+        inputs = inputs * mask
+        return inputs, mask
 
 
 class JaneStreetEncode1Dataset(AddNoiseMixin, Dataset):
@@ -122,7 +88,6 @@ class JaneStreetEncode1Dataset(AddNoiseMixin, Dataset):
         self.len = len(self.df)
         self.transform = transform
         self.device = device
-        self.dropout_model = nn.Dropout(p=0.5)
 
     # Getter
     def __getitem__(self, index):
@@ -246,107 +211,38 @@ class autoencoder(nn.Module):
         return x
 
 
-class classifier(nn.Module):
-    def __init__(
-        self,
-        small_number,
-        big_number,
-        dropout_p,
-    ):
-        super().__init__()
-        self.m = torch.nn.Sequential(
-            torch.nn.Linear(50, small_number),
-            nn.Dropout(p=dropout_p),
-            torch.nn.ReLU(),
-            nn.BatchNorm1d(small_number),
-            torch.nn.Linear(small_number, big_number),
-            nn.Dropout(p=dropout_p),
-            torch.nn.ReLU(),
-            nn.BatchNorm1d(big_number),
-            torch.nn.Linear(small_number, 1),
-        )
-
-    def forward(self, x):
-        x = self.m(x)
-        return x
-
-
 # nn.MSELoss
 # nn.SmoothL1Loss
 class EmphasizedSmoothL1Loss(nn.SmoothL1Loss):
-    def a__init__(
+    def __init__(
         self, size_average=None, reduce=None, reduction: str = "mean", beta: float = 1.0
     ) -> None:
         super().__init__(size_average, reduce, reduction, beta)
+        self.emphasize_ratio = 0.5
+        assert self.emphasize_ratio < 1
 
-        self.alfa = 0.7  # corrupted weight
-        self.beta = 1 - self.alfa  # not corrupted weight
+    @staticmethod
+    def reverse_mask(mask):
+        mask = torch.clone(mask)
+        mask[mask == 0] = 2
+        mask[mask == 1] = 0
+        mask[mask == 2] = 1
+        return mask
 
     def forward(self, input: Tensor, target: Tensor, mask: Tensor) -> Tensor:
-        # mask : zeros mean corrupted
-        # mask = mask.clone().detach()
-        # mask[mask == 0] = self.alfa
-        # mask[mask == 1] = self.beta
+        target = torch.clone(target)
+        distance = torch.abs(input - target)
+        distance = distance * self.reverse_mask(mask)
+        distance = distance.float()
+        target[input > target] = (
+            target[input > target] + distance[input > target] * self.emphasize_ratio
+        )
+        target[input < target] = (
+            target[input < target] - distance[input < target] * self.emphasize_ratio
+        )
+
         ret = super().forward(input, target)
         return ret
-        raise Exception("{} - {}".format(ret.shape, mask.shape))
-        return ret
-
-
-def train_model_classification(
-    model,
-    train_loader,
-    validation_loader,
-    n_epoch=None,
-    lr=None,
-    device=None,
-    phase=None,
-    criterion=None,
-):
-    writer = SummaryWriter()
-    # criterion = nn.MSELoss()
-    # criterion = nn.L1Loss()
-    criterion = nn.SmoothL1Loss()
-    # optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=lr)
-    # optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
-    accuracy_list = {}
-    loss_list = {}
-    for epoch in range(n_epoch):
-        for x, y in train_loader:
-            model.train()
-            optimizer.zero_grad()
-            z = model(x.float())
-            y = y.view(-1, 1).float()
-            y = y.float()
-            loss = criterion(z, y.float())
-            writer.add_scalar("Train data phase: {}".format(phase), loss, epoch)
-            loss.backward()
-            optimizer.step()
-            if not loss_list.get(epoch):
-                loss_list[epoch] = []
-            loss_list[epoch].append(loss.data.tolist())
-        # perform a prediction on the validation data
-        for x_test, y_test in validation_loader:
-            model.eval()
-            z = model(x_test.float())
-            # z = torch.zeros((100, 130)).to(device)
-            # z = y_test
-            y_test = y_test.view(-1, 1)
-            y_test = y_test.float()
-            loss = criterion(z, y_test.float())
-            writer.add_scalar("Validation data phase: {}".format(phase), loss, epoch)
-            if not accuracy_list.get(epoch):
-                accuracy_list[epoch] = []
-            accuracy_list[epoch].append(loss.data.tolist())
-
-    model.eval()
-    return (
-        accuracy_list,
-        loss_list,
-        None,
-        None,
-    )
 
 
 def train_model(
@@ -413,56 +309,6 @@ def train_model(
         build_encoded_layer(train_loader),
         build_encoded_layer(validation_loader),
     )
-
-
-def visual_control_classification(
-    model,
-    nrows,
-    validation_size,
-    batch_size,
-    device,
-    df,
-    validation_encoded_layer,
-    e1,
-    e2,
-    e3,
-):
-    df_size = int(len(df))
-    total_buy_signals = 0
-    acc_count = 0
-    total_count = 0
-    near_zeros = 0
-    for one in range(int(df_size / 10)):
-        index = np.random.randint(1, df_size - 1)
-        if df.iloc[index]["weight"] < 0.0001:
-            continue
-        a = df.iloc[index]["feature_0":"feature_129"].values
-        r = []
-        for one in range(batch_size):
-            r.append(a)
-        r = np.array(r)
-        model_input = torch.from_numpy(r).float().to(device)
-        z = e1.encoder(model_input)
-        z = e2.encoder(z)
-        z = e3.encoder(z)
-        pred = model(z)
-        pred = pred[0][0]
-
-        if float(pred) < 0.05 and float(pred) > -0.05:
-            near_zeros += 1
-
-        trade = torch.tensor(df.iloc[index]["trade"])
-        if trade == 0:
-            trade = -1
-        else:
-            total_buy_signals += 1
-        if (float(trade) * float(pred)) > 0:
-            acc_count += 1
-        total_count += 1
-
-    print("Accuracy is {}".format(acc_count / total_count))
-    print("Buy signals {}".format(total_buy_signals / total_count))
-    print("Near zeros {}".format(near_zeros / total_count))
 
 
 def visual_control(
