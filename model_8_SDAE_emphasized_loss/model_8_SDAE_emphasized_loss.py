@@ -70,11 +70,8 @@ class AddNoiseMixin:
         return mask
 
     def add_noise(self, inputs):
-        # noise = torch.randn_like(inputs)
-        # noise = inputs.clone().uniform_(-1, 1)
         mask = self.get_mask(inputs)
-        # noise = noise.multiply(1 / 16)
-        # noise = noise * mask
+        # zeros means corrupted
         inputs = inputs * mask
         return inputs, mask
 
@@ -232,17 +229,20 @@ class EmphasizedSmoothL1Loss(nn.SmoothL1Loss):
     def forward(self, input: Tensor, target: Tensor, mask: Tensor) -> Tensor:
         target = torch.clone(target)
         distance = torch.abs(input - target)
-        distance = distance * self.reverse_mask(mask)
+        # mask : zeros = corrupted
+        distance = distance * mask
         distance = distance.float()
+        # distance is only set for uncorrupted scalars, these are scalars which loss we wanna neglect a bit
+        # we will neglect it by setting the target to be closer to the input - for corrupted case, the distance
+        # will be zero - so their value will not change
         target[input > target] = (
             target[input > target] + distance[input > target] * self.emphasize_ratio
         )
         target[input < target] = (
             target[input < target] - distance[input < target] * self.emphasize_ratio
         )
-
         ret = super().forward(input, target)
-        return ret
+        return ret  # mask : zeros = corrupted
 
 
 def train_model(
