@@ -186,6 +186,25 @@ class JaneStreetEncode3Dataset(AddDropoutNoiseMixin, BaseJaneStreetEncode2Datase
     pass
 
 
+def get_core_model(input_size, output_size, hidden_count, dropout_p=0.15, net_width=32):
+    assert hidden_count > 0
+    layers = []
+
+    def append_layer(layers, input_size, output_size):
+        layers.append(torch.nn.Linear(input_size, net_width))
+        layers.append(nn.Dropout(p=dropout_p))
+        layers.append(torch.nn.ReLU())
+        layers.append(nn.BatchNorm1d(output_size))
+
+    append_layer(layers, input_size, net_width, dropout_p)
+
+    for one in hidden_count:
+        append_layer(layers, net_width, net_width)
+
+    append_layer(layers, net_width, output_size)
+    return torch.nn.Sequential(*layers)
+
+
 class autoencoder(nn.Module):
     def __init__(
         self, small_number, big_number, dropout_p, input_size, output_size, bottleneck
@@ -373,10 +392,13 @@ def extract_model_input(df, batch_size, device, e1, e2, e3, encoded_features_cou
         new_df = new_df.append(row_dict, ignore_index=True)
         return new_df
 
-    new_df = pd.DataFrame(columns=base_culumns + encoded_columns + original_columns, index=range(200))
+    new_df = pd.DataFrame(
+        columns=base_culumns + encoded_columns + original_columns, index=range(200)
+    )
     batch = []
     batch_original_rows = []
     import datetime
+
     for index, row in df.iterrows():
         a = row["feature_0":"feature_129"].values
         batch.append(a)
@@ -391,7 +413,7 @@ def extract_model_input(df, batch_size, device, e1, e2, e3, encoded_features_cou
             z = e2.encoder(z)
             z = e3.encoder(z)
             b = datetime.datetime.now()
-            print("encoded {} s".format((b-a).microseconds))
+            print("encoded {} s".format((b - a).microseconds))
             for i in range(len(z)):
                 new_df = append_to_df(
                     new_df, batch_original_rows[i], z[i].cpu().detach().numpy()
@@ -399,7 +421,7 @@ def extract_model_input(df, batch_size, device, e1, e2, e3, encoded_features_cou
             batch = []
             batch_original_rows = []
             c = datetime.datetime.now()
-            print("Index proceeding done {} {} s".format(index, (c-b).microseconds))
+            print("Index proceeding done {} {} s".format(index, (c - b).microseconds))
     new_df.to_csv("encoded.csv")
 
 
