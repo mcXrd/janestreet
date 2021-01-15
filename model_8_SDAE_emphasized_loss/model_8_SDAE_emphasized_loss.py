@@ -12,6 +12,11 @@ CSV_PATH = (
 )
 
 
+def strip_for_batch_size(df, batch_size):
+    strip = 1 + df.shape[0] % batch_size
+    return df.loc[: df.shape[0] - strip]
+
+
 class JaneStreetDataset(Dataset):
 
     # Constructor with defult values
@@ -63,12 +68,25 @@ class AddNoiseMixin:
     def init_dropout(self):
         self.dropout_model = nn.Dropout(p=0.2)
 
+    @staticmethod
+    def reverse_mask(mask):
+        mask = torch.clone(mask)
+        mask[mask == 0] = 2
+        mask[mask == 1] = 0
+        mask[mask == 2] = 1
+        return mask
+
     def get_mask(self, inputs):
+        """
+        zeros must mean corrupted - ones must mean uncorrupted
+        """
         mask = torch.ones_like(inputs)
         mask = self.dropout_model(mask)
         mask[mask != 0] = 1
         return mask
 
+
+class AddDropoutNoiseMixin(AddNoiseMixin):
     def add_noise(self, inputs):
         mask = self.get_mask(inputs)
         # zeros means corrupted
@@ -76,7 +94,24 @@ class AddNoiseMixin:
         return inputs, mask
 
 
-class JaneStreetEncode1Dataset(AddNoiseMixin, Dataset):
+class AddGausseNoiseMixin(AddNoiseMixin):
+    def init_dropout(self):
+        self.dropout_model = nn.Dropout(p=0.5)
+
+    def add_noise(self, inputs):
+        noise = torch.randn_like(inputs)
+        noise = noise.multiply(1 / 4)
+        mask = self.get_mask(inputs)
+        # mask - zeros means corrupted
+        reversed_mask = self.reverse_mask(mask)
+        # reversed_mask - zeros means noncorrupted
+        noise = noise * reversed_mask
+        # noise is zero when mask is uncorrupted/zero
+        inputs = inputs + noise
+        return inputs, mask
+
+
+class JaneStreetEncode1Dataset(AddDropoutNoiseMixin, Dataset):
 
     # Constructor with defult values
     def __init__(self, df, device, transform=None):
@@ -110,7 +145,7 @@ class JaneStreetEncode1Dataset(AddNoiseMixin, Dataset):
         return self.len
 
 
-class JaneStreetEncode2Dataset(AddNoiseMixin, Dataset):
+class BaseJaneStreetEncode2Dataset(Dataset):
 
     # Constructor with defult values
     def __init__(
@@ -118,42 +153,12 @@ class JaneStreetEncode2Dataset(AddNoiseMixin, Dataset):
         encoded_layer,
         device,
         transform=None,
-        noise_type=None,
-        noise_multiplicator=None,
-        noise_dropout=None,
     ):
         self.init_dropout()
         self.encoded_layer = encoded_layer
         self.len = len(encoded_layer)
         self.transform = transform
         self.device = device
-        self.noise_type = noise_type
-        self.noise_multiplicator = noise_multiplicator
-        self.noise_dropout = noise_dropout
-        self.noise_dropout = nn.Dropout(p=self.noise_dropout)
-
-    def add_noise2(self, inputs):
-        assert self.noise_multiplicator
-        assert self.noise_dropout is not None
-        if self.noise_type == "G":
-            noise = torch.randn_like(inputs)
-        elif self.noise_type == "U":
-            noise = inputs.clone().uniform_()
-        elif self.noise_type == "A":
-            multiplier = 1 + np.random.randint(-3, 3) / 100  # from 0.97 to 1.03
-            inputs = inputs.multiply(multiplier)
-            return inputs
-        elif self.noise_dropout:
-            inputs = self.noise_dropout(inputs)
-            return inputs
-        else:
-            raise Exception("Unknown noise")
-        noise = noise.multiply(self.noise_multiplicator)
-        mask = torch.ones_like(inputs)
-        mask = self.dropout_model(mask)
-        noise = noise * mask
-        inputs = inputs + noise
-        return inputs, mask
 
     # Getter
     def __getitem__(self, index):
@@ -171,6 +176,14 @@ class JaneStreetEncode2Dataset(AddNoiseMixin, Dataset):
     # Get Length
     def __len__(self):
         return self.len
+
+
+class JaneStreetEncode2Dataset(AddGausseNoiseMixin, BaseJaneStreetEncode2Dataset):
+    pass
+
+
+class JaneStreetEncode3Dataset(AddDropoutNoiseMixin, BaseJaneStreetEncode2Dataset):
+    pass
 
 
 class autoencoder(nn.Module):
@@ -218,14 +231,6 @@ class EmphasizedSmoothL1Loss(nn.SmoothL1Loss):
         self.emphasize_ratio = 0.5
         assert self.emphasize_ratio < 1
 
-    @staticmethod
-    def reverse_mask(mask):
-        mask = torch.clone(mask)
-        mask[mask == 0] = 2
-        mask[mask == 1] = 0
-        mask[mask == 2] = 1
-        return mask
-
     def forward(self, input: Tensor, target: Tensor, mask: Tensor) -> Tensor:
         target = torch.clone(target)
         distance = torch.abs(input - target)
@@ -269,8 +274,6 @@ def train_model(
             model.train()
             optimizer.zero_grad()
             z = model(x.float())
-            # y = y.view(-1, 1).float()
-            # y = y.float()
             loss = criterion(z, y.float(), mask)
             writer.add_scalar("Train data phase: {}".format(phase), loss, epoch)
             loss.backward()
@@ -282,11 +285,7 @@ def train_model(
         for x_test, y_test, mask_test in validation_loader:
             model.eval()
             z = model(x_test.float())
-            # z = torch.zeros((100, 130)).to(device)
-            # z = y_test
-            # y_test = y_test.view(-1, 1)
-            # y_test = y_test.float()
-            loss = criterion(z, y_test.float(), mask)
+            loss = criterion(z, y_test.float(), mask_test)
             writer.add_scalar("Validation data phase: {}".format(phase), loss, epoch)
             if not accuracy_list.get(epoch):
                 accuracy_list[epoch] = []
@@ -311,9 +310,7 @@ def train_model(
     )
 
 
-def visual_control(
-    model, nrows, validation_size, batch_size, device, df, validation_encoded_layer
-):
+def visual_control(model, batch_size, device, df, validation_encoded_layer):
     model.eval()
     index = np.random.randint(0, len(validation_encoded_layer))
     actual_data = df.iloc[index]["feature_0":"feature_129"].values
@@ -353,15 +350,68 @@ def print_losses(accuracy_list, n_epoch, phase):
     )
 
 
+def extract_model_input(df, batch_size, device, e1, e2, e3, encoded_features_count=50):
+    base_culumns = ["date", "weight", "resp_1", "resp_2", "resp_3", "resp_4", "resp"]
+    encoded_columns = []
+    original_columns = []
+    for one in range(encoded_features_count):
+        encoded_columns.append("enc_feature_{}".format(one))
+
+    for one in range(130):
+        original_columns.append("feature_{}".format(one))
+
+    def append_to_df(new_df, source_df_row, encoded_layer):
+        row_dict = {}
+        for column_name in base_culumns:
+            row_dict[column_name] = source_df_row[column_name]
+        for column_name in original_columns:
+            row_dict[column_name] = source_df_row[column_name]
+        index = 0
+        for one in encoded_layer:
+            row_dict[encoded_columns[index]] = one
+            index += 1
+        new_df = new_df.append(row_dict, ignore_index=True)
+        return new_df
+
+    new_df = pd.DataFrame(columns=base_culumns + encoded_columns + original_columns, index=range(200))
+    batch = []
+    batch_original_rows = []
+    import datetime
+    for index, row in df.iterrows():
+        a = row["feature_0":"feature_129"].values
+        batch.append(a)
+        batch_original_rows.append(row)
+
+        if len(batch) == batch_size:
+            print("Index proceeding {}".format(index))
+            a = datetime.datetime.now()
+
+            model_input = torch.from_numpy(np.array(batch)).float().to(device)
+            z = e1.encoder(model_input)
+            z = e2.encoder(z)
+            z = e3.encoder(z)
+            b = datetime.datetime.now()
+            print("encoded {} s".format((b-a).microseconds))
+            for i in range(len(z)):
+                new_df = append_to_df(
+                    new_df, batch_original_rows[i], z[i].cpu().detach().numpy()
+                )
+            batch = []
+            batch_original_rows = []
+            c = datetime.datetime.now()
+            print("Index proceeding done {} {} s".format(index, (c-b).microseconds))
+    new_df.to_csv("encoded.csv")
+
+
 def main(
-    nrows=400000,
-    big_number=500,
-    small_number=500,
+    nrows=None,  # 2390491 total
+    big_number=1000,
+    small_number=1000,
     dropout_p=0.15,
-    validation_size=40000,
+    validation_size=200000,
     batch_size=200,
-    n_epoch=25,
-    lr=0.15,
+    n_epoch=5,
+    lr=0.2,
 ):
     assert torch.cuda.is_available()
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -371,14 +421,15 @@ def main(
         # skiprows=range(1, 500000),
     )
     df = df.fillna(0)
-    df = df.multiply(1)
-    frac = 1 / 20
+    df = strip_for_batch_size(df, batch_size)
+    # df = df.multiply(1)
+    frac = 1 / 5
     train_sample = df.iloc[:-validation_size]
     train_sample = train_sample.sample(frac=frac).reset_index()
+    train_sample = strip_for_batch_size(train_sample, batch_size)
     validation_sample = df.iloc[-validation_size:]
     validation_sample = validation_sample.sample(frac=frac).reset_index()
-    nrows = int(nrows * frac)
-    validation_size = int(validation_size * frac)
+    validation_sample = strip_for_batch_size(validation_sample, batch_size)
 
     janestreet1_train = JaneStreetEncode1Dataset(df=train_sample, device=device)
     janestreet1_validation = JaneStreetEncode1Dataset(
@@ -424,16 +475,10 @@ def main(
     janestreet2_train = JaneStreetEncode2Dataset(
         encoded_layer=train_encoded_layer1,
         device=device,
-        noise_type=None,
-        noise_multiplicator=1 / 16,
-        noise_dropout=0.2,
     )
     janestreet2_validation = JaneStreetEncode2Dataset(
         encoded_layer=validation_encoded_layer1,
         device=device,
-        noise_type=None,
-        noise_multiplicator=1 / 16,
-        noise_dropout=0.2,
     )
     train_loader2 = torch.utils.data.DataLoader(
         dataset=janestreet2_train, batch_size=batch_size, drop_last=True
@@ -472,19 +517,13 @@ def main(
 
     print_losses(accuracy_list, n_epoch, 2)
 
-    janestreet3_train = JaneStreetEncode2Dataset(
+    janestreet3_train = JaneStreetEncode3Dataset(
         encoded_layer=train_encoded_layer2,
         device=device,
-        noise_type="A",
-        noise_multiplicator=1 / 32,
-        noise_dropout=0.0,
     )
-    janestreet3_validation = JaneStreetEncode2Dataset(
+    janestreet3_validation = JaneStreetEncode3Dataset(
         encoded_layer=validation_encoded_layer2,
         device=device,
-        noise_type="A",
-        noise_multiplicator=1 / 32,
-        noise_dropout=0.0,
     )
     train_loader3 = torch.utils.data.DataLoader(
         dataset=janestreet3_train, batch_size=batch_size, drop_last=True
@@ -527,22 +566,20 @@ def main(
 
     visual_control(
         model3,
-        nrows,
-        validation_size,
         batch_size,
         device,
         validation_sample,
         validation_encoded_layer2,
     )
-
     return
 
     df = pd.read_csv(
         CSV_PATH,
-        nrows=100,
+        nrows=100000,
         # skiprows=range(1, 500000),
     )
     df = df.fillna(0)
+    df = strip_for_batch_size(df, batch_size)
     extract_model_input(
         df, batch_size, device, model1, model2, model3, encoded_features_count=50
     )
