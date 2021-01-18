@@ -10,6 +10,7 @@ from torch import Tensor
 CSV_PATH = (
     "/home/vaclavmatejka/devel/janestreet/jane-street-market-prediction/train.csv"
 )
+ENCODED_CSV = "encoded.csv"
 
 
 def strip_for_batch_size(df, batch_size):
@@ -112,6 +113,8 @@ class AddGausseNoiseMixin(AddNoiseMixin):
 
 
 class JaneStreetEncode1Dataset(AddDropoutNoiseMixin, Dataset):
+    def init_dropout(self):
+        self.dropout_model = nn.Dropout(p=0.2)
 
     # Constructor with defult values
     def __init__(self, df, device, transform=None):
@@ -178,30 +181,34 @@ class BaseJaneStreetEncode2Dataset(Dataset):
         return self.len
 
 
-class JaneStreetEncode2Dataset(AddGausseNoiseMixin, BaseJaneStreetEncode2Dataset):
-    pass
+class JaneStreetEncode2Dataset(AddDropoutNoiseMixin, BaseJaneStreetEncode2Dataset):
+    def init_dropout(self):
+        self.dropout_model = nn.Dropout(p=0.18)
 
 
 class JaneStreetEncode3Dataset(AddDropoutNoiseMixin, BaseJaneStreetEncode2Dataset):
-    pass
+    def init_dropout(self):
+        self.dropout_model = nn.Dropout(p=0.16)
 
 
 def get_core_model(input_size, output_size, hidden_count, dropout_p=0.15, net_width=32):
     assert hidden_count > 0
     layers = []
 
-    def append_layer(layers, input_size, output_size):
-        layers.append(torch.nn.Linear(input_size, net_width))
+    def append_layer(layers, _input_size, _output_size, just_linear=False):
+        layers.append(torch.nn.Linear(_input_size, _output_size))
+        if just_linear:
+            return
         layers.append(nn.Dropout(p=dropout_p))
         layers.append(torch.nn.ReLU())
-        layers.append(nn.BatchNorm1d(output_size))
+        layers.append(nn.BatchNorm1d(_output_size))
 
-    append_layer(layers, input_size, net_width, dropout_p)
+    append_layer(layers, input_size, net_width)
 
-    for one in hidden_count:
+    for one in range(hidden_count):
         append_layer(layers, net_width, net_width)
 
-    append_layer(layers, net_width, output_size)
+    append_layer(layers, net_width, output_size, just_linear=True)
     return torch.nn.Sequential(*layers)
 
 
@@ -210,6 +217,9 @@ class autoencoder(nn.Module):
         self, small_number, big_number, dropout_p, input_size, output_size, bottleneck
     ):
         super(autoencoder, self).__init__()
+        self.encoder = get_core_model(input_size, bottleneck, 1, net_width=big_number)
+        self.decoder = get_core_model(bottleneck, output_size, 1, net_width=big_number)
+        """
         self.encoder = torch.nn.Sequential(
             torch.nn.Linear(input_size, small_number),
             nn.Dropout(p=dropout_p),
@@ -232,6 +242,7 @@ class autoencoder(nn.Module):
             nn.BatchNorm1d(big_number),
             torch.nn.Linear(small_number, output_size),
         )
+        """
 
     def forward(self, x):
         x = self.encoder(x)
@@ -373,67 +384,101 @@ def extract_model_input(df, batch_size, device, e1, e2, e3, encoded_features_cou
     base_culumns = ["date", "weight", "resp_1", "resp_2", "resp_3", "resp_4", "resp"]
     encoded_columns = []
     original_columns = []
-    for one in range(encoded_features_count):
-        encoded_columns.append("enc_feature_{}".format(one))
 
     for one in range(130):
         original_columns.append("feature_{}".format(one))
+    original_columns.append("ts_id")
 
-    def append_to_df(new_df, source_df_row, encoded_layer):
-        row_dict = {}
-        for column_name in base_culumns:
-            row_dict[column_name] = source_df_row[column_name]
-        for column_name in original_columns:
-            row_dict[column_name] = source_df_row[column_name]
-        index = 0
-        for one in encoded_layer:
-            row_dict[encoded_columns[index]] = one
-            index += 1
-        new_df = new_df.append(row_dict, ignore_index=True)
-        return new_df
+    for one in range(encoded_features_count):
+        encoded_columns.append("enc_feature_{}".format(one))
 
-    new_df = pd.DataFrame(
-        columns=base_culumns + encoded_columns + original_columns, index=range(200)
-    )
     batch = []
     batch_original_rows = []
-    import datetime
+
+    new_data = []
+    new_df = pd.DataFrame(
+        new_data,
+        columns=base_culumns + original_columns + encoded_columns,
+    )
+    new_df.to_csv(ENCODED_CSV)
+
+    def save_part_to_csv(_new_df, new_data):
+        _new_df = pd.DataFrame(
+            new_data,
+            columns=base_culumns + original_columns + encoded_columns,
+        )
+        _new_df.to_csv(ENCODED_CSV, mode="a", header=False)
 
     for index, row in df.iterrows():
+        if len(new_data) > 10000:
+            save_part_to_csv(new_df, new_data)
+            new_data = []
+
         a = row["feature_0":"feature_129"].values
         batch.append(a)
         batch_original_rows.append(row)
 
         if len(batch) == batch_size:
-            print("Index proceeding {}".format(index))
-            a = datetime.datetime.now()
 
             model_input = torch.from_numpy(np.array(batch)).float().to(device)
             z = e1.encoder(model_input)
             z = e2.encoder(z)
             z = e3.encoder(z)
-            b = datetime.datetime.now()
-            print("encoded {} s".format((b - a).microseconds))
+            assert len(z) == len(batch_original_rows)
             for i in range(len(z)):
-                new_df = append_to_df(
-                    new_df, batch_original_rows[i], z[i].cpu().detach().numpy()
+                row_list = (
+                    batch_original_rows[i].tolist()
+                    + z[i].cpu().detach().numpy().tolist()
                 )
+                new_data.append(row_list)
+
             batch = []
             batch_original_rows = []
-            c = datetime.datetime.now()
-            print("Index proceeding done {} {} s".format(index, (c - b).microseconds))
-    new_df.to_csv("encoded.csv")
+    save_part_to_csv(new_df, new_data)
+    new_data = []
+
+    new_df = pd.read_csv(
+        ENCODED_CSV,
+        nrows=1000,
+    )
+    pd.testing.assert_frame_equal(
+        new_df.loc[0:899, "date":"feature_129"],
+        df.loc[0:899, "date":"feature_129"],
+        check_dtype=False,
+    )
+
+    test_new_df_source = new_df.loc[200 : 199 + batch_size, "feature_0":"feature_129"]
+    test_new_df_encode = new_df.loc[
+        200 : 199 + batch_size, "enc_feature_0":"enc_feature_49"
+    ]
+    model_input = torch.from_numpy(np.array(test_new_df_source)).float().to(device)
+    z = e1.encoder(model_input)
+    z = e2.encoder(z)
+    z = e3.encoder(z)
+    test_new_df_fresh_encode = pd.DataFrame(
+        z.cpu().detach().numpy(),
+        columns=encoded_columns,
+    )
+    pd.testing.assert_frame_equal(
+        test_new_df_encode.loc[
+            200 : 199 + batch_size, "enc_feature_0":"enc_feature_49"
+        ].reset_index(drop=True),
+        test_new_df_fresh_encode.loc[:, "enc_feature_0":"enc_feature_49"].reset_index(
+            drop=True
+        ),
+        check_dtype=False,
+    )
 
 
-def main(
+def create_autencoder(
     nrows=None,  # 2390491 total
-    big_number=1000,
-    small_number=1000,
+    big_number=1500,
+    small_number=1500,
     dropout_p=0.15,
-    validation_size=200000,
+    validation_size=150000,
     batch_size=200,
-    n_epoch=5,
-    lr=0.2,
+    n_epoch=2,
+    lr=0.20,
 ):
     assert torch.cuda.is_available()
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -445,7 +490,7 @@ def main(
     df = df.fillna(0)
     df = strip_for_batch_size(df, batch_size)
     # df = df.multiply(1)
-    frac = 1 / 5
+    frac = 1 / 1
     train_sample = df.iloc[:-validation_size]
     train_sample = train_sample.sample(frac=frac).reset_index()
     train_sample = strip_for_batch_size(train_sample, batch_size)
@@ -593,12 +638,34 @@ def main(
         validation_sample,
         validation_encoded_layer2,
     )
-    return
+    return model1, model2, model3, device
 
+
+def main(
+    nrows=None,  # 2390491 total
+    big_number=1500,
+    small_number=1500,
+    dropout_p=0.15,
+    validation_size=1000,
+    batch_size=200,
+    n_epoch=2,
+    lr=0.20,
+):
+    model1, model2, model3, device = create_autencoder(
+        nrows=nrows,  # 2390491 total
+        big_number=big_number,
+        small_number=small_number,
+        dropout_p=dropout_p,
+        validation_size=validation_size,
+        batch_size=batch_size,
+        n_epoch=n_epoch,
+        lr=lr,
+    )
+    p = 0.5
     df = pd.read_csv(
         CSV_PATH,
-        nrows=100000,
-        # skiprows=range(1, 500000),
+        # nrows=100000,
+        # skiprows=lambda i: i > 0 and np.random.random() > p,
     )
     df = df.fillna(0)
     df = strip_for_batch_size(df, batch_size)
