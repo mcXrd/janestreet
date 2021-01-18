@@ -114,7 +114,7 @@ class AddGausseNoiseMixin(AddNoiseMixin):
 
 class JaneStreetEncode1Dataset(AddDropoutNoiseMixin, Dataset):
     def init_dropout(self):
-        self.dropout_model = nn.Dropout(p=0.2)
+        self.dropout_model = nn.Dropout(p=0.24)
 
     # Constructor with defult values
     def __init__(self, df, device, transform=None):
@@ -183,12 +183,12 @@ class BaseJaneStreetEncode2Dataset(Dataset):
 
 class JaneStreetEncode2Dataset(AddDropoutNoiseMixin, BaseJaneStreetEncode2Dataset):
     def init_dropout(self):
-        self.dropout_model = nn.Dropout(p=0.18)
+        self.dropout_model = nn.Dropout(p=0.22)
 
 
 class JaneStreetEncode3Dataset(AddDropoutNoiseMixin, BaseJaneStreetEncode2Dataset):
     def init_dropout(self):
-        self.dropout_model = nn.Dropout(p=0.16)
+        self.dropout_model = nn.Dropout(p=0.20)
 
 
 def get_core_model(input_size, output_size, hidden_count, dropout_p=0.15, net_width=32):
@@ -479,6 +479,7 @@ def create_autencoder(
     batch_size=200,
     n_epoch=2,
     lr=0.20,
+    effective_train_data=4000000,
 ):
     assert torch.cuda.is_available()
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -489,6 +490,11 @@ def create_autencoder(
     )
     df = df.fillna(0)
     df = strip_for_batch_size(df, batch_size)
+    n_epoch = int(effective_train_data / df.shape[0]) + 1
+    if n_epoch < 2:
+        n_epoch = 2
+    print("n_epoch {}".format(n_epoch))
+
     # df = df.multiply(1)
     frac = 1 / 1
     train_sample = df.iloc[:-validation_size]
