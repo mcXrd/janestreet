@@ -6,12 +6,13 @@ from torch.utils.tensorboard import SummaryWriter
 import torch.nn as nn
 import fire
 from torch import Tensor
+from resnet1d import Net1D
 
 CSV_PATH = (
     "/home/vaclavmatejka/devel/janestreet/jane-street-market-prediction/encoded.csv"
 )
 ENCODED_CSV = "encoded.csv"
-ENC_ENABLED = False
+ENC_ENABLED = True
 print("ENC_ENABLED {}".format(ENC_ENABLED))
 
 
@@ -24,10 +25,9 @@ class JaneStreetDataset(Dataset):
 
     # Constructor with defult values
     def __init__(self, df, device, transform=None, batch_size=None):
-        df.insert(3, "trade", None)
-        df.loc[df["resp"] <= 0, "trade"] = -0.1
-        df.loc[df["resp"] > 0, "trade"] = 0.1
-
+        df.insert(4, "trade", None)
+        df.loc[df["resp"] <= 0, "trade"] = -10
+        df.loc[df["resp"] > 0, "trade"] = 10
         df.trade = df.trade.multiply(1)
         df.resp = df.resp.multiply(1)
         self.df = df
@@ -53,7 +53,7 @@ class JaneStreetDataset(Dataset):
 
         sample = (
             x,
-            torch.tensor(self.df.iloc[index]["trade":"resp"]).float().to(self.device),
+            torch.tensor(self.df.iloc[index]["trade":"trade"]).float().to(self.device),
         )
         if self.transform:
             sample = self.transform(sample)
@@ -64,15 +64,25 @@ class JaneStreetDataset(Dataset):
         return self.len
 
 
-def get_core_model(
-    input_size,
-    output_size,
-    hidden_count,
-    dropout_p=0.15,
-    net_width=32,
-    scale_factor=1,
-    min_scale=64,
-):
+def get_core_model(input_size, output_size, hidden_count, dropout_p=0.15, net_width=32):
+    if True:
+        base_filters = 50
+        filter_list = [64, 160, 160, 400, 400, 1024, 1024]
+        m_blocks_list = [2, 2, 2, 3, 3, 4, 4]
+        model = Net1D(
+            in_channels=1,
+            base_filters=base_filters,
+            ratio=1.0,
+            filter_list=filter_list,
+            m_blocks_list=m_blocks_list,
+            kernel_size=16,
+            stride=2,
+            groups_width=16,
+            verbose=False,
+            n_classes=1,
+        )
+        return model
+
     assert hidden_count > 0
     layers = []
 
@@ -87,11 +97,7 @@ def get_core_model(
     append_layer(layers, input_size, net_width)
 
     for one in range(hidden_count):
-        old_net_width = net_width
-        possible_net_width = int(net_width * scale_factor)
-        if possible_net_width > min_scale:
-            net_width = possible_net_width
-        append_layer(layers, old_net_width, net_width)
+        append_layer(layers, net_width, net_width)
 
     append_layer(layers, net_width, output_size, just_linear=True)
     return torch.nn.Sequential(*layers)
@@ -102,8 +108,6 @@ class CustomSmoothL1Loss(nn.SmoothL1Loss):
         target = torch.clone(target)
         # where we have missmatch in signs - meaning we missed big - we will make the error way bigger
         target[input * target < 0] = target[input * target < 0] * 50
-        # target[target == 10] = 30
-        # target[target == -10] = -30
         ret = super().forward(input, target)
         return ret
 
@@ -120,25 +124,15 @@ def train_model(
 ):
     writer = SummaryWriter()
     # criterion = nn.SmoothL1Loss()
-    criterion = CustomSmoothL1Loss()
-    # criterion = nn.MSELoss()
-    # optimizer = torch.optim.AdamW(model.parameters())
-    # optimizer = torch.optim.Adadelta(model.parameters())
-    # optimizer = torch.optim.RMSprop(model.parameters())
-    # optimizer = torch.optim.Adagrad(model.parameters())
-    # optimizer = torch.optim.LBFGS(model.parameters())
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-3)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.1, patience=10
-    )
-    # optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=lr)
+    # criterion = CustomSmoothL1Loss()
+    criterion = nn.BCEWithLogitsLoss()
     # optimizer = torch.optim.Adam(model.parameters())
+    # optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=lr * 3)
+    optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=lr)
     accuracy_list = {}
     loss_list = {}
-    scheduler_count = 0
     for epoch in range(n_epoch):
         for x, y in train_loader:
-            scheduler_count += 1
             model.train()
             optimizer.zero_grad()
             z = model(x.float())
@@ -149,22 +143,18 @@ def train_model(
             if not loss_list.get(epoch):
                 loss_list[epoch] = []
             loss_list[epoch].append(loss.data.tolist())
-
-            if scheduler_count % 40000 == 0:
-                scheduler.step(scheduler_count / 40000)
-
         # perform a prediction on the validation data
         accurate_guess = 0
         total_count = 0
-
         for x_test, y_test in validation_loader:
             model.eval()
             z = model(x_test.float())
 
             for one in range(len(z)):
-                # if y_test[one][1] > 0:
                 total_count += 1
-                if z[one][0] * y_test[one][0] > 0:
+                if (z[one][0] > 0 and y_test[one][0] == 10) or (
+                    z[one][0] <= 0 and y_test[one][0] == -10
+                ):
                     accurate_guess += 1
 
             loss = criterion(z, y_test.float())
@@ -228,7 +218,7 @@ def print_losses(accuracy_list, n_epoch, phase):
 
 
 def create_and_train_model(
-    nrows=None,  # 2390491 total
+    nrows=20000,  # 2390491 total
     big_number=1500,
     small_number=1500,
     dropout_p=0.15,
@@ -236,21 +226,21 @@ def create_and_train_model(
     batch_size=200,
     n_epoch=2,
     lr=0.05,
-    effective_train_data=400000,
+    effective_train_data=60000,
 ):
     assert torch.cuda.is_available()
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     df = pd.read_csv(
         CSV_PATH,
         nrows=nrows,
-        # skiprows=range(1, 500000),
+        skiprows=range(1, 500000),
     )
     before = df.shape[0]
     df = df[df["weight"] > 0]
     after = df.shape[0]
     print("after / before {}".format(after / before))
     df = df.fillna(0)
-    frac = (1 / 10) * (before / after)
+    frac = (1 / 20) * (before / after)
     n_epoch = int(effective_train_data / (df.shape[0] * frac)) + 1
     if n_epoch < 2:
         n_epoch = 2
@@ -272,20 +262,15 @@ def create_and_train_model(
     validation_loader1 = torch.utils.data.DataLoader(
         dataset=janestreet_validation, batch_size=batch_size, drop_last=True
     )
-    hidden_count = 4
-    big_number = 2000
+    hidden_count = 2
+    big_number = 1500
     if ENC_ENABLED:
         model = get_core_model(
-            50,
-            7,
-            hidden_count,
-            dropout_p=0.15,
-            net_width=big_number,
-            scale_factor=1 / 1,
+            50, 1, hidden_count, dropout_p=0.15, net_width=big_number
         )
     else:
         model = get_core_model(
-            130, 7, hidden_count, dropout_p=0.15, net_width=big_number
+            130, 1, hidden_count, dropout_p=0.15, net_width=big_number
         )
     model = model.float()
     model.to(device)
@@ -320,11 +305,11 @@ def create_and_train_model(
 
 
 def main(
-    nrows=100000,  # 2390491 total
+    nrows=20000,  # 2390491 total
     big_number=1500,
     small_number=1500,
     dropout_p=0.15,
-    validation_size=5000,
+    validation_size=500000,
     batch_size=200,
     n_epoch=2,
     lr=0.05,
