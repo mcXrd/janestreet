@@ -36,6 +36,7 @@ USE_FINISHED_ENCODE = False
 LBFGS = False
 FLOAT_SIZE = "float64"
 WEIGHTED_RESPS = True
+DATE_OVERFIT_FILL = None
 
 try:
     if not USE_FINISHED_ENCODE:
@@ -54,29 +55,20 @@ def get_file_size(filename: str) -> int:
         return sum(1 for line in f)
 
 
-def add_time_columns_to_df(df: pd.DataFrame, fill: float = None) -> pd.DataFrame:
-    fill = 1
+def add_time_columns_to_df(df: pd.DataFrame, eval: bool = False) -> pd.DataFrame:
     # "w_ts_id" 0 means beginning of the day, 1 means end of the day
     # "w_date" 0 means first day, 1 means last day
     # 0.5 is middle day/dataset
     feature_0_pos = df.columns.get_loc("feature_0")
     df.insert(feature_0_pos, "w_date", None)
-    if fill:
-        df.loc[:, "w_date"] = fill
+    if DATE_OVERFIT_FILL is None:
+        df.loc[:, "w_date"] = 1
+    if eval and DATE_OVERFIT_FILL:
+        df.loc[:, "w_date"] = DATE_OVERFIT_FILL
     else:
         df.loc[:, "w_date"] = df["date"] / df["date"].max()
-    """
-    for one in range(int(df["date"].max() + 1)):
-        min_id = df.loc[df["date"] == one, :]["ts_id"].min()
-        max_id = df.loc[df["date"] == one, :]["ts_id"].max()
-        distance = max_id - min_id
-        df.loc[df["date"] == one, "w_ts_id"] = (
-            df.loc[df["date"] == one, :]["ts_id"] - min_id
-        ) / distance
-    # w_ts_id	w_date	feature_0	...	feature_122	feature_123	....
-    """
 
-    weight_w_date = 1
+    weight_w_date = 10 if DATE_OVERFIT_FILL else 1
     df.loc[:, "w_date"] = df.loc[:, "w_date"] * weight_w_date
     df = df.astype(FLOAT_SIZE)
     return df
@@ -416,6 +408,8 @@ def extract_model_input(
         new_df.loc[0:899, "date":"feature_129"],
         df.loc[0:899, "date":"feature_129"],
         check_dtype=False,
+        check_exact=False,
+        check_less_precise=3,
     )
     test_new_df_source = new_df.loc[
         200 : 199 + batch_size,
@@ -442,6 +436,8 @@ def extract_model_input(
             :, "enc_feature_0" : "enc_feature_{}".format(ENCODED_FEATURES_COUNT - 1)
         ].reset_index(drop=True),
         check_dtype=False,
+        check_exact=False,
+        check_less_precise=3,
     )
 
 
@@ -846,7 +842,7 @@ if JANE_STREET_SUBMISSION:
     print("models ready")
     env = janestreet.make_env()
     for (test_df, pred_df) in tqdm(env.iter_test()):
-        test_df = add_time_columns_to_df(test_df, fill=0.9)
+        test_df = add_time_columns_to_df(test_df, eval=True)
         if not test_df["weight"].item() > 0:
             pred_df.action = 0
             env.predict(pred_df)
