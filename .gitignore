@@ -1,6 +1,6 @@
 jane-street-market-prediction/
 .idea/
-model_1_simple_ann/runs/*
-model_1_simple_ann/runs/
 .ipynb_checkpoints
 runs/
+*runs/*
+*encoded.csv

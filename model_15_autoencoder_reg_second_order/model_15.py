@@ -10,9 +10,17 @@ from torch import Tensor
 CSV_PATH = (
     "/home/vaclavmatejka/devel/janestreet/jane-street-market-prediction/train.csv"
 )
+USE_FINISHED_ENCODE = False
 ENCODED_CSV = "encoded.csv"
+import os
 
-ONLY_FIRST_ENCODER = True
+try:
+    if not USE_FINISHED_ENCODE:
+        os.remove(ENCODED_CSV)
+except FileNotFoundError:
+    pass
+DEVICE = device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+print(DEVICE)
 
 
 def get_file_size(filename):
@@ -22,6 +30,7 @@ def get_file_size(filename):
 
 def get_df_from_source(path, effective_train_data) -> (pd.DataFrame, int, int):
     min_epochs = 2
+    max_line_count = 2000000
     line_count = get_file_size(path)
 
     epochs_ratio = effective_train_data / line_count
@@ -32,6 +41,9 @@ def get_df_from_source(path, effective_train_data) -> (pd.DataFrame, int, int):
     else:
         p = 1
         epochs = int(epochs_ratio)
+
+    if line_count > max_line_count:
+        p = p * (max_line_count / line_count)
 
     df = pd.read_csv(
         path,
@@ -81,23 +93,6 @@ class AddDropoutNoiseMixin(AddNoiseMixin):
         return inputs, mask
 
 
-class AddGausseNoiseMixin(AddNoiseMixin):
-    def init_dropout(self):
-        self.dropout_model = nn.Dropout(p=0.5)
-
-    def add_noise(self, inputs):
-        noise = torch.randn_like(inputs)
-        noise = noise.multiply(1 / 4)
-        mask = self.get_mask(inputs)
-        # mask - zeros means corrupted
-        reversed_mask = self.reverse_mask(mask)
-        # reversed_mask - zeros means noncorrupted
-        noise = noise * reversed_mask
-        # noise is zero when mask is uncorrupted/zero
-        inputs = inputs + noise
-        return inputs, mask
-
-
 class JaneStreetEncode1Dataset(AddDropoutNoiseMixin, Dataset):
     def init_dropout(self):
         self.dropout_model = nn.Dropout(p=0.2)
@@ -134,84 +129,15 @@ class JaneStreetEncode1Dataset(AddDropoutNoiseMixin, Dataset):
         return self.len
 
 
-class BaseJaneStreetEncode2Dataset(Dataset):
-
-    # Constructor with defult values
-    def __init__(
-        self,
-        encoded_layer,
-        device,
-        transform=None,
-    ):
-        self.init_dropout()
-        self.encoded_layer = encoded_layer
-        self.len = len(encoded_layer)
-        self.transform = transform
-        self.device = device
-
-    # Getter
-    def __getitem__(self, index):
-        inputs, mask = self.add_noise(torch.from_numpy(self.encoded_layer[index]))
-        sample = (inputs, torch.from_numpy(self.encoded_layer[index]), mask)
-        sample = (
-            sample[0].to(self.device),
-            sample[1].to(self.device),
-            sample[2].to(self.device),
-        )
-        if self.transform:
-            sample = self.transform(sample)
-        return sample
-
-    # Get Length
-    def __len__(self):
-        return self.len
-
-
-class JaneStreetEncode2Dataset(AddDropoutNoiseMixin, BaseJaneStreetEncode2Dataset):
-    def init_dropout(self):
-        self.dropout_model = nn.Dropout(p=0.12)
-
-
-class JaneStreetEncode3Dataset(AddDropoutNoiseMixin, BaseJaneStreetEncode2Dataset):
-    def init_dropout(self):
-        self.dropout_model = nn.Dropout(p=0.17)
-
-
 class autoencoder(nn.Module):
-    def __init__(
-        self, small_number, big_number, dropout_p, input_size, output_size, bottleneck
-    ):
+    def __init__(self, input_size, output_size, bottleneck):
         super(autoencoder, self).__init__()
         self.encoder = get_core_model(
-            input_size, bottleneck, 1, dropout_p=dropout_p, net_width=big_number
+            input_size, bottleneck, 1, dropout_p=0.16, net_width=1500
         )
         self.decoder = get_core_model(
-            bottleneck, output_size, 1, dropout_p=dropout_p, net_width=big_number
+            bottleneck, output_size, 1, dropout_p=0.16, net_width=1500
         )
-        """
-        self.encoder = torch.nn.Sequential(
-            torch.nn.Linear(input_size, small_number),
-            nn.Dropout(p=dropout_p),
-            torch.nn.ReLU(),
-            nn.BatchNorm1d(small_number),
-            torch.nn.Linear(small_number, big_number),
-            nn.Dropout(p=dropout_p),
-            torch.nn.ReLU(),
-            nn.BatchNorm1d(big_number),
-            torch.nn.Linear(small_number, bottleneck),
-        )
-        self.decoder = torch.nn.Sequential(
-            torch.nn.Linear(bottleneck, small_number),
-            nn.Dropout(p=dropout_p),
-            torch.nn.ReLU(),
-            nn.BatchNorm1d(small_number),
-            torch.nn.Linear(small_number, big_number),
-            nn.Dropout(p=dropout_p),
-            torch.nn.ReLU(),
-            nn.BatchNorm1d(big_number),
-            torch.nn.Linear(small_number, output_size),
-        )
-        """
 
     def forward(self, x):
         x = self.encoder(x)
@@ -252,17 +178,11 @@ def train_model_encoder(
     train_loader,
     validation_loader,
     n_epoch=None,
-    lr=None,
     phase=None,
-    device=None,
 ):
     writer = SummaryWriter()
-    # criterion = nn.MSELoss()
-    # criterion = nn.L1Loss()
-    # criterion = nn.SmoothL1Loss()
     criterion = EmphasizedSmoothL1Loss()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-    # optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=lr)
     accuracy_list = {}
     loss_list = {}
     for epoch in range(n_epoch):
@@ -306,28 +226,6 @@ def train_model_encoder(
     )
 
 
-def visual_control(model, batch_size, device, df, validation_encoded_layer):
-    model.eval()
-    index = np.random.randint(0, len(validation_encoded_layer))
-    actual_data = df.iloc[index]["feature_0":"feature_129"].values
-    a = validation_encoded_layer[index]
-    r = []
-    for one in range(batch_size):
-        r.append(a)
-    r = np.array(r)
-    model_input = torch.from_numpy(r).float().to(device)
-    z = model(model_input)
-    print("Input data")
-    print("len {}".format(len(a)))
-    print(a[:20])
-    print("actual_data")
-    print("len {}".format(len(actual_data)))
-    print(actual_data[:20])
-    print("Denoised data")
-    print("len {}".format(len(z[0])))
-    print(z[0][:20])
-
-
 def print_losses(accuracy_list, n_epoch, phase):
     print("phase {}".format(phase))
     print(
@@ -346,7 +244,9 @@ def print_losses(accuracy_list, n_epoch, phase):
     )
 
 
-def extract_model_input(df, batch_size, device, e1, e2, e3, encoded_features_count=50):
+def extract_model_input(
+    df, batch_size, device, encoder_model, encoded_features_count=50
+):
     base_culumns = ["date", "weight", "resp_1", "resp_2", "resp_3", "resp_4", "resp"]
     encoded_columns = []
     original_columns = []
@@ -387,10 +287,7 @@ def extract_model_input(df, batch_size, device, e1, e2, e3, encoded_features_cou
         if len(batch) == batch_size:
 
             model_input = torch.from_numpy(np.array(batch)).float().to(device)
-            z = e1.encoder(model_input)
-            if not ONLY_FIRST_ENCODER:
-                z = e2.encoder(z)
-                z = e3.encoder(z)
+            z = encoder_model.encoder(model_input)
             assert len(z) == len(batch_original_rows)
             for i in range(len(z)):
                 row_list = (
@@ -419,10 +316,7 @@ def extract_model_input(df, batch_size, device, e1, e2, e3, encoded_features_cou
         200 : 199 + batch_size, "enc_feature_0":"enc_feature_49"
     ]
     model_input = torch.from_numpy(np.array(test_new_df_source)).float().to(device)
-    z = e1.encoder(model_input)
-    if not ONLY_FIRST_ENCODER:
-        z = e2.encoder(z)
-        z = e3.encoder(z)
+    z = encoder_model.encoder(model_input)
     test_new_df_fresh_encode = pd.DataFrame(
         z.cpu().detach().numpy(),
         columns=encoded_columns,
@@ -439,14 +333,9 @@ def extract_model_input(df, batch_size, device, e1, e2, e3, encoded_features_cou
 
 
 def create_autencoder(
-    big_number=1500,
-    small_number=1500,
-    dropout_p=0.15,
     batch_size=200,
-    lr=0.20,
     effective_train_data=1000000,
 ):
-    assert torch.cuda.is_available()
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     df, n_epoch, validation_size = get_df_from_source(CSV_PATH, effective_train_data)
     print("n_epoch {}".format(n_epoch))
@@ -468,16 +357,10 @@ def create_autencoder(
     validation_loader1 = torch.utils.data.DataLoader(
         dataset=janestreet1_validation, batch_size=batch_size, drop_last=True
     )
-    bottleneck = 60
-    if ONLY_FIRST_ENCODER:
-        bottleneck = 50
     model1 = autoencoder(
-        small_number=small_number,
-        big_number=big_number,
-        dropout_p=dropout_p,
         input_size=130,
         output_size=130,
-        bottleneck=bottleneck,
+        bottleneck=50,
     )
     model1 = model1.float()
     model1.to(device)
@@ -487,8 +370,6 @@ def create_autencoder(
         train_loader1,
         validation_loader1,
         n_epoch=n_epoch,
-        lr=lr,
-        device=device,
         phase=1,
     )
     (
@@ -502,109 +383,7 @@ def create_autencoder(
 
     print_losses(accuracy_list, n_epoch, 1)
 
-    if ONLY_FIRST_ENCODER:
-        return model1, None, None, device
-
-    janestreet2_train = JaneStreetEncode2Dataset(
-        encoded_layer=train_encoded_layer1,
-        device=device,
-    )
-    janestreet2_validation = JaneStreetEncode2Dataset(
-        encoded_layer=validation_encoded_layer1,
-        device=device,
-    )
-    train_loader2 = torch.utils.data.DataLoader(
-        dataset=janestreet2_train, batch_size=batch_size, drop_last=True
-    )
-    validation_loader2 = torch.utils.data.DataLoader(
-        dataset=janestreet2_validation, batch_size=batch_size, drop_last=True
-    )
-    model2 = autoencoder(
-        small_number=small_number,
-        big_number=big_number,
-        dropout_p=dropout_p,
-        input_size=60,
-        output_size=60,
-        bottleneck=55,
-    )
-    model2 = model2.float()
-    model2.to(device)
-    train_res = train_model_encoder(
-        model2,
-        train_loader2,
-        validation_loader2,
-        n_epoch=n_epoch,
-        lr=lr,
-        device=device,
-        phase=2,
-    )
-    (
-        accuracy_list,
-        loss_list,
-        train_encoded_layer2,
-        validation_encoded_layer2,
-    ) = train_res
-
-    assert len(train_encoded_layer2) == len(janestreet2_train)
-    assert len(validation_encoded_layer2) == len(janestreet2_validation)
-
-    print_losses(accuracy_list, n_epoch, 2)
-
-    janestreet3_train = JaneStreetEncode3Dataset(
-        encoded_layer=train_encoded_layer2,
-        device=device,
-    )
-    janestreet3_validation = JaneStreetEncode3Dataset(
-        encoded_layer=validation_encoded_layer2,
-        device=device,
-    )
-    train_loader3 = torch.utils.data.DataLoader(
-        dataset=janestreet3_train, batch_size=batch_size, drop_last=True
-    )
-    validation_loader3 = torch.utils.data.DataLoader(
-        dataset=janestreet3_validation, batch_size=batch_size, drop_last=True
-    )
-
-    model3 = autoencoder(
-        small_number=small_number,
-        big_number=big_number,
-        dropout_p=dropout_p,
-        input_size=55,
-        output_size=55,
-        bottleneck=50,
-    )
-    model3 = model3.float()
-    model3.to(device)
-
-    train_res = train_model_encoder(
-        model3,
-        train_loader3,
-        validation_loader3,
-        n_epoch=n_epoch,
-        lr=lr,
-        device=device,
-        phase=3,
-    )
-    (
-        accuracy_list,
-        loss_list,
-        train_encoded_layer3,
-        validation_encoded_layer3,
-    ) = train_res
-
-    assert len(train_encoded_layer3) == len(janestreet3_train)
-    assert len(validation_encoded_layer3) == len(janestreet3_validation)
-
-    print_losses(accuracy_list, n_epoch, 3)
-
-    visual_control(
-        model3,
-        batch_size,
-        device,
-        validation_sample,
-        validation_encoded_layer2,
-    )
-    return model1, model2, model3, device
+    return model1
 
 
 class JaneStreetDatasetPredict(Dataset):
@@ -646,11 +425,8 @@ def get_core_model(
     input_size,
     output_size,
     hidden_count,
-    dropout_p=0.15,
+    dropout_p=0.16,
     net_width=32,
-    scale_factor=1,
-    min_scale=64,
-    sigmoid=False,
 ):
     assert hidden_count > 0
     layers = []
@@ -660,20 +436,13 @@ def get_core_model(
         if just_linear:
             return
         layers.append(nn.Dropout(p=dropout_p))
-        if sigmoid:
-            layers.append(torch.nn.Sigmoid())
-        else:
-            layers.append(torch.nn.ELU())
+        layers.append(torch.nn.ELU())
         layers.append(nn.BatchNorm1d(_output_size))
 
     append_layer(layers, input_size, net_width)
 
     for one in range(hidden_count):
-        old_net_width = net_width
-        possible_net_width = int(net_width * scale_factor)
-        if possible_net_width > min_scale:
-            net_width = possible_net_width
-        append_layer(layers, old_net_width, net_width)
+        append_layer(layers, net_width, net_width)
 
     append_layer(layers, net_width, output_size, just_linear=True)
     return torch.nn.Sequential(*layers)
@@ -683,9 +452,7 @@ class CustomSmoothL1Loss(nn.SmoothL1Loss):
     def forward(self, input: Tensor, target: Tensor) -> Tensor:
         target = torch.clone(target)
         # where we have missmatch in signs - meaning we missed big - we will make the error way bigger
-        target[input * target < 0] = target[input * target < 0] * 5
-        target[target == 5] = 10
-        target[target == -5] = -10
+        target[input * target < 0] = target[input * target < 0] * 2
         ret = super().forward(input, target)
         return ret
 
@@ -699,7 +466,8 @@ def train_model_predict(
     phase=None,
 ):
     writer = SummaryWriter()
-    # criterion = nn.SmoothL1Loss()
+    criterion = nn.SmoothL1Loss()
+    # criterion = nn.BCEWithLogitsLoss()
     criterion = CustomSmoothL1Loss()
     # criterion = nn.MSELoss()
     # optimizer = torch.optim.AdamW(model.parameters())
@@ -712,7 +480,18 @@ def train_model_predict(
     #    optimizer, mode="min", factor=0.1, patience=10
     # )
     # optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=lr)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    LBFGS = True
+    if not LBFGS:
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    else:
+        optimizer = torch.optim.LBFGS(
+            model.parameters(),
+            max_iter=2,
+            history_size=50,
+            lr=0.05,
+            tolerance_grad=1e-7,  # 1e-7
+            tolerance_change=1e-9,  # 1e-9
+        )
     accuracy_list = {}
     loss_list = {}
     scheduler_count = 0
@@ -720,26 +499,45 @@ def train_model_predict(
         for x, y in train_loader:
             scheduler_count += 1
             model.train()
-            optimizer.zero_grad()
-            z = model(x.float())
-            loss = criterion(z, y.float())
-            writer.add_scalar("Train data phase: {}".format(phase), loss, epoch)
-            loss.backward()
-            optimizer.step()
+            if not LBFGS:
+                optimizer.zero_grad()
+                z = model(x.float())
+                loss = criterion(z, y.float())
+                writer.add_scalar("Train data phase: {}".format(phase), loss, epoch)
+                loss.backward()
+
+            def closure():
+                if torch.is_grad_enabled():
+                    optimizer.zero_grad()
+                z = model(x.float())
+                loss = criterion(z, y.float())
+                if loss.requires_grad:
+                    loss.backward()
+                return loss
+
+            if LBFGS:
+                optimizer.step(closure)
+            else:
+                optimizer.step()
+
+            if LBFGS:
+                z = model(x.float())
+                loss = criterion(z, y.float())
+                writer.add_scalar("Train data phase: {}".format(phase), loss, epoch)
             if not loss_list.get(epoch):
                 loss_list[epoch] = []
             loss_list[epoch].append(loss.data.tolist())
 
-            if scheduler_count % 40000 == 0:
-                pass
+            if scheduler_count % 5000 == 0:
+                print("500 batches passed")
                 # scheduler.step(scheduler_count / 40000)
 
         # perform a prediction on the validation data
         accurate_guess = 0
         accurate_guess_from_random = 0
-        accurate_guess_from_resps_mean = 0
-        accurate_guess_from_resps_median = 0
-        total_count = 0
+        accurate_guess_from_mean = 0
+        accurate_guess_from_median = 0
+        total_count = 1
 
         for x_test, y_test in validation_loader:
             model.eval()
@@ -757,10 +555,10 @@ def train_model_predict(
                     accurate_guess_from_random += 1
 
                 if torch.mean(z[one][1:]) * y_test[one][0] > 0:
-                    accurate_guess_from_resps_mean += 1
+                    accurate_guess_from_mean += 1
 
                 if torch.median(z[one][1:]) * y_test[one][0] > 0:
-                    accurate_guess_from_resps_median += 1
+                    accurate_guess_from_median += 1
 
             loss = criterion(z, y_test.float())
             writer.add_scalar("Validation data phase: {}".format(phase), loss, epoch)
@@ -775,12 +573,12 @@ def train_model_predict(
         )
         print(
             "epoch_{} accuracy from resps mean: {}".format(
-                epoch, accurate_guess_from_resps_mean / total_count
+                epoch, accurate_guess_from_mean / total_count
             )
         )
         print(
-            "epoch_{} accuracy from resps mean: {}".format(
-                epoch, accurate_guess_from_resps_median / total_count
+            "epoch_{} accuracy from resps median: {}".format(
+                epoch, accurate_guess_from_median / total_count
             )
         )
 
@@ -789,16 +587,26 @@ def train_model_predict(
     return (accuracy_list, loss_list)
 
 
+def batchify(row, batch_size):
+    row = list(row)
+    ret = []
+    for one in range(batch_size):
+        ret.append(row)
+    ret = np.array(ret)
+    return ret
+
+
+def model_input_from_row(row, batch_size, device):
+    batch_of_rows = batchify(row, batch_size)
+    model_input = torch.from_numpy(batch_of_rows).float().to(device)
+    return model_input
+
+
 def visual_control_predict(model, batch_size, device, df):
     model.eval()
     index = np.random.randint(1, len(df))
-    a = df.iloc[index]["enc_feature_0":"enc_feature_49"].values
-    a = list(a)
-    r = []
-    for one in range(batch_size):
-        r.append(a)
-    r = np.array(r)
-    model_input = torch.from_numpy(r).float().to(device)
+    row = df.iloc[index]["enc_feature_0":"enc_feature_49"].values
+    model_input = model_input_from_row(row, batch_size, device)
     z = model(model_input)
     print("Model output")
     print(z[0])
@@ -836,16 +644,12 @@ def create_and_train_predict_model(
     validation_loader1 = torch.utils.data.DataLoader(
         dataset=janestreet_validation, batch_size=batch_size, drop_last=True
     )
-    hidden_count = 2
-    big_number = 1600
     model = get_core_model(
         50,
         7,
-        hidden_count,
+        hidden_count=6,
         dropout_p=0.15,
-        net_width=big_number,
-        scale_factor=1 / 1,
-        sigmoid=False,
+        net_width=150,
     )
 
     model = model.float()
@@ -869,49 +673,41 @@ def create_and_train_predict_model(
         device,
         validation_sample,
     )
-    return model, device
+    return model
 
 
 def main(
-    big_number=1500,
-    small_number=1500,
-    dropout_p=0.15,
-    batch_size=200,
-    lr=0.20,
-    effective_train_data=1000000,
+    batch_size=500,
+    effective_train_data=10000,
 ):
-    model_enc1, model_enc2, model_enc3, device = create_autencoder(
-        big_number=big_number,
-        small_number=small_number,
-        dropout_p=dropout_p,
-        batch_size=batch_size,
-        lr=lr,
-        effective_train_data=effective_train_data,
-    )
+    if not USE_FINISHED_ENCODE:
+        encoder_model = create_autencoder(
+            batch_size=batch_size,
+            effective_train_data=effective_train_data,
+        )
 
-    df, n_epoch, validation_size = get_df_from_source(CSV_PATH, effective_train_data)
-    initial_df_size = df.shape[0]
-    df = strip_for_batch_size(df, batch_size)
-    extract_model_input(
-        df,
-        batch_size,
-        device,
-        model_enc1,
-        model_enc2,
-        model_enc3,
-        encoded_features_count=50,
-    )
+        df, n_epoch, validation_size = get_df_from_source(
+            CSV_PATH, effective_train_data
+        )
+        df = strip_for_batch_size(df, batch_size)
+        extract_model_input(
+            df,
+            batch_size,
+            DEVICE,
+            encoder_model,
+            encoded_features_count=50,
+        )
     df, n_epoch, validation_size = get_df_from_source(ENCODED_CSV, effective_train_data)
-    print("encoded df: {} initial df: {}".format(df.shape[0], initial_df_size))
 
-    model = create_and_train_predict_model(
+    predict_model = create_and_train_predict_model(
         df,
         validation_size=validation_size,
-        batch_size=40,
+        batch_size=batch_size,
         n_epoch=n_epoch,
         lr=0.05,
     )
     print("Done")
+    # return encoder_model, predict_model
 
 
 if __name__ == "__main__":

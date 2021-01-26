@@ -11,7 +11,7 @@ CSV_PATH = (
     "/home/vaclavmatejka/devel/janestreet/jane-street-market-prediction/encoded.csv"
 )
 ENCODED_CSV = "encoded.csv"
-ENC_ENABLED = False
+ENC_ENABLED = True
 print("ENC_ENABLED {}".format(ENC_ENABLED))
 
 
@@ -25,8 +25,8 @@ class JaneStreetDataset(Dataset):
     # Constructor with defult values
     def __init__(self, df, device, transform=None, batch_size=None):
         df.insert(3, "trade", None)
-        df.loc[df["resp"] <= 0, "trade"] = -0.1
-        df.loc[df["resp"] > 0, "trade"] = 0.1
+        df.loc[df["resp"] <= 0, "trade"] = -1
+        df.loc[df["resp"] > 0, "trade"] = 1
 
         df.trade = df.trade.multiply(1)
         df.resp = df.resp.multiply(1)
@@ -81,7 +81,7 @@ def get_core_model(
         if just_linear:
             return
         layers.append(nn.Dropout(p=dropout_p))
-        layers.append(torch.nn.ReLU())
+        layers.append(torch.nn.ELU())
         layers.append(nn.BatchNorm1d(_output_size))
 
     append_layer(layers, input_size, net_width)
@@ -101,7 +101,7 @@ class CustomSmoothL1Loss(nn.SmoothL1Loss):
     def forward(self, input: Tensor, target: Tensor) -> Tensor:
         target = torch.clone(target)
         # where we have missmatch in signs - meaning we missed big - we will make the error way bigger
-        target[input * target < 0] = target[input * target < 0] * 50
+        target[input * target < 0] = target[input * target < 0] * 5
         # target[target == 10] = 30
         # target[target == -10] = -30
         ret = super().forward(input, target)
@@ -328,7 +328,7 @@ def main(
     batch_size=200,
     n_epoch=2,
     lr=0.05,
-    effective_train_data=100000,
+    effective_train_data=2000000,
 ):
     model, device = create_and_train_model(
         nrows=nrows,  # 2390491 total
