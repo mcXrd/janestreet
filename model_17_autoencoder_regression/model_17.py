@@ -90,7 +90,7 @@ def add_time_columns_to_df(df: pd.DataFrame, eval: bool = False) -> pd.DataFrame
 def get_df_from_source(
     path: str, effective_train_data: int
 ) -> (pd.DataFrame, int, int):
-    max_line_count = 1000000
+    max_line_count = 1100000
     line_count = get_file_size(path)
     print("line count: {}".format(line_count))
 
