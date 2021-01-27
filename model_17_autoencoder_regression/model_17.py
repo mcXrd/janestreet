@@ -1,9 +1,23 @@
-# This Python 3 environment comes with many helpful analytics libraries installed
-# It is defined by the kaggle/python Docker image: https://github.com/kaggle/docker-python
-# For example, here's several helpful packages to load
+"""
+    Jan 27. 2021 - https://www.kaggle.com/c/jane-street-market-prediction Jane Street Market Prediction
 
-import numpy as np  # linear algebra
-import pandas as pd  # data processing, CSV file I/O (e.g. pd.read_csv)
+    Goal of this model is to remove noise from given features and extract better, more
+    stable features using autoencoder - and then use these features to predict
+    trade decisions with simple ANN
+
+
+    papers used:
+    Autoencoders that don’t overfit towards the Identity
+    https://proceedings.neurips.cc/paper/2020/file/e33d974aae13e4d877477d51d8bafdc4-Paper.pdf
+    and
+    Stacked Denoising Autoencoders: Learning Useful Representations in a Deep Network with a Local Denoising Criterion
+    https://www.jmlr.org/papers/volume11/vincent10a/vincent10a.pdf
+
+
+
+"""
+import numpy as np
+import pandas as pd
 import torch
 from tqdm import tqdm
 from torch.utils.data import Dataset
@@ -19,9 +33,6 @@ JANE_STREET_SUBMISSION = False
 if not JANE_STREET_SUBMISSION:
     import fire
 
-# Input data files are available in the read-only "../input/" directory
-# For example, running this (by clicking run or pressing Shift+Enter) will list all files under the input directory
-
 if JANE_STREET_SUBMISSION:
     for dirname, _, filenames in os.walk("/kaggle/input"):
         for filename in filenames:
@@ -32,11 +43,13 @@ else:
         "/home/vaclavmatejka/devel/janestreet/jane-street-market-prediction/train.csv"
     )
 ENCODED_CSV = "encoded.csv"
-USE_FINISHED_ENCODE = False
-LBFGS = False
+USE_FINISHED_ENCODE = (
+    True  # if True run just prediction model and use the old ENCODED_CSV file
+)
+LBFGS = False  # if True Broyden–Fletcher–Goldfarb–Shanno algorithm else Adam
 FLOAT_SIZE = "float64"
-WEIGHTED_RESPS = True
-DATE_OVERFIT_FILL = None
+WEIGHTED_RESPS = True  # if True - we are going to use responses multiplied by weight
+DATE_OVERFIT_FILL = None  # for providing also date informations - deprecated in the favor of the stability
 
 try:
     if not USE_FINISHED_ENCODE:
@@ -97,7 +110,6 @@ def get_df_from_source(
     )
     df = df.fillna(0)
     df = df.astype(FLOAT_SIZE)
-    # df = df.query("date > 85").reset_index(drop=True)
     validation_size = int(df.shape[0] / 10)
     print(df.shape)
     if WEIGHTED_RESPS:
@@ -260,11 +272,11 @@ def train_model_encoder(
 ) -> Tuple[dict, dict, np.ndarray, np.ndarray]:
     writer = SummaryWriter()
     criterion = EmphasizedSmoothL1Loss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
     accuracy_list = {}
     loss_list = {}
     for epoch in range(n_epoch):
-        for x, y, mask in train_loader:
+        for x, y, mask in tqdm(train_loader):
             model.train()
             optimizer.zero_grad()
             z = model(x.float())
@@ -369,7 +381,7 @@ def extract_model_input(
         )
         _new_df.to_csv(ENCODED_CSV, mode="a", header=False)
 
-    for index, row in df.iterrows():
+    for index, row in tqdm(df.iterrows()):
         if len(new_data) > 100000:
             save_part_to_csv(new_df, new_data)
             new_data = []
@@ -592,18 +604,17 @@ def train_model_predict(
 ) -> Tuple[dict, dict]:
     writer = SummaryWriter()
     criterion = CustomSmoothL1Loss()
-    # criterion = nn.SmoothL1Loss()
     if not LBFGS:
-        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
     else:
         optimizer = torch.optim.LBFGS(
-            model.parameters(), max_iter=2, history_size=10, lr=0.2
+            model.parameters(), max_iter=5, history_size=15, lr=0.01
         )
     accuracy_list = {}
     loss_list = {}
     scheduler_count = 0
     for epoch in range(n_epoch):
-        for x, y in train_loader:
+        for x, y in tqdm(train_loader):
             scheduler_count += 1
             model.train()
             if not LBFGS:
@@ -833,9 +844,9 @@ if not JANE_STREET_SUBMISSION and __name__ == "__main__":
 if JANE_STREET_SUBMISSION:
     import janestreet
 
-    BATCH_SIZE = 50
+    BATCH_SIZE = 500
     encoder_model, predict_model = main(
-        effective_train_data=1500, batch_size=BATCH_SIZE
+        effective_train_data=400000, batch_size=BATCH_SIZE
     )
     encoder_model.eval()
     predict_model.eval()
@@ -857,6 +868,3 @@ if JANE_STREET_SUBMISSION:
 
         pred_df.action = 1 if torch.mean(z[0]) > 0.0 else 0
         env.predict(pred_df)
-
-    # You can write up to 20GB to the current directory (/kaggle/working/) that gets preserved as output when you create a version using "Save & Run All"
-    # You can also write temporary files to /kaggle/temp/, but they won't be saved outside of the current session
