@@ -1,9 +1,9 @@
 """
-    Jan 27. 2021 - https://www.kaggle.com/c/jane-street-market-prediction Jane Street Market Prediction
+    Jan 30. 2021 - https://www.kaggle.com/c/jane-street-market-prediction Jane Street Market Prediction
 
     Goal of this model is to remove noise from given features and extract better, more
     stable features using autoencoder - and then use these features to predict
-    trade decisions with simple ANN
+    trade decisions with simple MLP
 
 
     papers used:
@@ -12,8 +12,6 @@
     and
     Stacked Denoising Autoencoders: Learning Useful Representations in a Deep Network with a Local Denoising Criterion
     https://www.jmlr.org/papers/volume11/vincent10a/vincent10a.pdf
-
-
 
 """
 import numpy as np
@@ -44,7 +42,7 @@ else:
     )
 ENCODED_CSV = "encoded.csv"
 USE_FINISHED_ENCODE = (
-    True  # if True run just prediction model and use the old ENCODED_CSV file
+    False  # if True run just prediction model and use the old ENCODED_CSV file
 )
 LBFGS = False  # if True Broyden–Fletcher–Goldfarb–Shanno algorithm else Adam
 FLOAT_SIZE = "float64"
@@ -58,7 +56,7 @@ except FileNotFoundError:
     pass
 
 # assert torch.cuda.is_available()
-DEVICE = device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print(DEVICE)
 ENCODED_FEATURES_COUNT = 70
 FEATURE_STRING = "enc_feature_"
@@ -77,7 +75,7 @@ def add_time_columns_to_df(df: pd.DataFrame, eval: bool = False) -> pd.DataFrame
     df.insert(feature_0_pos, "w_date", None)
     if DATE_OVERFIT_FILL is None:
         df.loc[:, "w_date"] = 1
-    if eval and DATE_OVERFIT_FILL:
+    elif eval and DATE_OVERFIT_FILL:
         df.loc[:, "w_date"] = DATE_OVERFIT_FILL
     else:
         df.loc[:, "w_date"] = df["date"] / df["date"].max()
@@ -91,19 +89,20 @@ def add_time_columns_to_df(df: pd.DataFrame, eval: bool = False) -> pd.DataFrame
 def get_df_from_source(
     path: str, effective_train_data: int
 ) -> (pd.DataFrame, int, int):
-    max_line_count = 1100000
+    max_line_count = 1000000
     line_count = get_file_size(path)
     print("line count: {}".format(line_count))
 
     p = 1
     if line_count > max_line_count:
         p = max_line_count / line_count
+        line_count = max_line_count
 
     if effective_train_data > line_count:
         epochs = int(effective_train_data / line_count)
     if effective_train_data <= line_count:
         epochs = 1
-        p = effective_train_data / line_count
+        p = p * (effective_train_data / line_count)
 
     df = pd.read_csv(
         path,
@@ -112,6 +111,8 @@ def get_df_from_source(
     df = df.fillna(df.mean())
     df = df.astype(FLOAT_SIZE)
     validation_size = int(df.shape[0] / 10)
+    if JANE_STREET_SUBMISSION:
+        validation_size = 0
     print(df.shape)
     if WEIGHTED_RESPS:
         df = df[df["weight"] != 0]
@@ -277,6 +278,7 @@ def train_model_encoder(
     accuracy_list = {}
     loss_list = {}
     for epoch in range(n_epoch):
+        print("Train encoder model:")
         for x, y, mask in tqdm(train_loader):
             model.train()
             optimizer.zero_grad()
@@ -290,6 +292,7 @@ def train_model_encoder(
                 loss_list[epoch] = []
             loss_list[epoch].append(loss.data.tolist())
         # perform a prediction on the validation data
+        print("Validation encoder model:")
         for x_test, y_test, mask_test in validation_loader:
             model.eval()
             z = model(x_test.float())
@@ -518,7 +521,7 @@ def create_autencoder_and_train(
 
 class JaneStreetDatasetPredict(Dataset):
 
-    Y_LEN = 6
+    Y_LEN = 2
 
     # Constructor with defult values
     def __init__(self, df, device, transform=None, batch_size=None):
@@ -554,7 +557,7 @@ class JaneStreetDatasetPredict(Dataset):
             .float()
             .to(self.device)
         )
-        y = torch.tensor(self.df.iloc[index]["weight":"resp"]).float().to(self.device)
+        y = torch.tensor(self.df.iloc[index]["resp_4":"resp"]).float().to(self.device)
         assert len(y) == JaneStreetDatasetPredict.Y_LEN
 
         item = (x, y)
@@ -595,10 +598,25 @@ def get_core_model(
 
 
 class CustomSmoothL1Loss(nn.SmoothL1Loss):
+    """
+    this custom loss should make the learning behave partially like regression and partially like classification
+    """
+
     def forward(self, input: Tensor, target: Tensor) -> Tensor:
         target = torch.clone(target)
-        # where we have missmatch in signs - meaning we missed critically - we will make the error bigger
-        target[input * target < 0] = target[input * target < 0] * 3
+
+        distance = torch.abs(input - target)
+        zero_pass_factor = torch.ones_like(distance)
+        zero_pass_factor[input * target < 0] = zero_pass_factor[input * target < 0] * 3
+
+        distance[distance < 1] = torch.exp(distance[distance < 1])
+        distance[distance > 1] = distance[distance > 1] + np.e
+        distance = distance * zero_pass_factor
+        distance = distance.float()
+
+        target[input > target] = input[input > target] - distance[input > target]
+        target[input < target] = input[input < target] + distance[input < target]
+
         ret = super().forward(input, target)
         return ret
 
@@ -613,10 +631,7 @@ def train_model_predict(
     writer = SummaryWriter()
     criterion = CustomSmoothL1Loss()
     if not LBFGS:
-        optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
-        scheduler = torch.optim.lr_scheduler.StepLR(
-            optimizer, step_size=len(train_loader) * n_epoch / 5, gamma=0.1
-        )
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
     else:
         optimizer = torch.optim.LBFGS(
             model.parameters(), max_iter=5, history_size=15, lr=0.01
@@ -625,6 +640,7 @@ def train_model_predict(
     loss_list = {}
     scheduler_count = 0
     for epoch in range(n_epoch):
+        print("Train predict model:")
         for x, y in tqdm(train_loader):
             scheduler_count += 1
             model.train()
@@ -649,7 +665,6 @@ def train_model_predict(
                 optimizer.step(closure)
             else:
                 optimizer.step()
-                scheduler.step()
 
             if LBFGS:
                 z = model(x.float())
@@ -663,30 +678,42 @@ def train_model_predict(
         # perform a prediction on the validation data
         accurate_guess = 0
         accurate_guess_from_random = 0
-        accurate_guess_from_mean = 0
-        accurate_guess_from_median = 0
+        accurate_guess_from_batch_noise_mean = 0
+        accurate_guess_from_batch_noise_majority = 0
+        accurate_guess_from_batch_noise_mean_majority = 0
+
         total_count = 0
 
-        for x_test, y_test in validation_loader:
+        print("Validation predict model:")
+        for x_test, y_test in tqdm(validation_loader):
             model.eval()
             z = model(x_test.float())
 
-            for one in range(len(z)):
-                # if y_test[one][1] > 0:
+            for z_index in range(len(z)):
                 total_count += 1
                 rand_choice = int(torch.randint(0, 2, (1, 1))[0])
                 if rand_choice == 0:
                     rand_choice = -1
-                if z[one][-1] * y_test[one][-1] > 0:
+                if z[z_index][-1] * y_test[z_index][-1] > 0:
                     accurate_guess += 1
-                if z[one][-1] * rand_choice > 0:
+                if z[z_index][-1] * rand_choice > 0:
                     accurate_guess_from_random += 1
 
-                if torch.mean(z[one][1:]) * y_test[one][-1] > 0:
-                    accurate_guess_from_mean += 1
+                noisy_x_test = add_noise_to_model_input_tensor(
+                    batchify_to_tensor(x_test[z_index], 11)
+                )
+                noisy_z = model(noisy_x_test.float())
+                trade = get_trade_from_noisy_mean(noisy_z)
+                if trade * y_test[z_index][-1] > 0:
+                    accurate_guess_from_batch_noise_mean += 1
 
-                if torch.median(z[one][1:]) * y_test[one][-1] > 0:
-                    accurate_guess_from_median += 1
+                trade = get_trade_from_noisy_majority(noisy_z)
+                if trade * y_test[z_index][-1] > 0:
+                    accurate_guess_from_batch_noise_majority += 1
+
+                trade = get_trade_from_noisy_mean_majority(noisy_z)
+                if trade * y_test[z_index][-1] > 0:
+                    accurate_guess_from_batch_noise_mean_majority += 1
 
             loss = criterion(z, y_test.float())
             if not JANE_STREET_SUBMISSION:
@@ -703,16 +730,20 @@ def train_model_predict(
             )
         )
         print(
-            "epoch_{} accuracy from resps mean: {}".format(
-                epoch, accurate_guess_from_mean / total_count
+            "epoch_{} accuracy from noisy mean: {}".format(
+                epoch, accurate_guess_from_batch_noise_mean / total_count
             )
         )
         print(
-            "epoch_{} accuracy from resps median: {}".format(
-                epoch, accurate_guess_from_median / total_count
+            "epoch_{} accuracy from noisy majority: {}".format(
+                epoch, accurate_guess_from_batch_noise_majority / total_count
             )
         )
-
+        print(
+            "epoch_{} accuracy from noisy mean majority: {}".format(
+                epoch, accurate_guess_from_batch_noise_mean_majority / total_count
+            )
+        )
     model.eval()
 
     return (accuracy_list, loss_list)
@@ -727,18 +758,58 @@ def batchify(row: np.ndarray, batch_size: int) -> np.ndarray:
     return ret
 
 
-def model_input_from_row(
-    row: np.ndarray, batch_size: int, device: torch.DeviceObjType
-) -> torch.nn.Module:
+def batchify_to_tensor(row: Tensor, batch_size: int) -> Tensor:
+    row = row.cpu().detach().numpy()
     batch_of_rows = batchify(row, batch_size)
-    model_input = torch.from_numpy(batch_of_rows).float().to(device)
+    return torch.from_numpy(batch_of_rows).float().to(DEVICE)
+
+
+def model_input_from_row(
+    row: np.ndarray,
+    batch_size: int,
+) -> Tensor:
+    batch_of_rows = batchify(row, batch_size)
+    model_input = torch.from_numpy(batch_of_rows).float().to(DEVICE)
     return model_input
+
+
+def add_noise_to_model_input_tensor(batch_of_rows: Tensor) -> Tensor:
+    ret = []
+    for row in batch_of_rows:
+        noise = torch.randn_like(row)
+        noise = noise.multiply(1 / 4)
+        row = row + noise
+        row = row.cpu().detach().numpy()
+        ret.append(row)
+    return torch.from_numpy(np.array(ret)).float().to(DEVICE)
+
+
+def get_trade_from_noisy_majority(z: Tensor) -> int:
+    trades = []
+    for row in z:
+        trade = 1 if row[-1] > 0 else -1
+        trades.append(trade)
+    return 1 if sum(trades) > 0 else -1
+
+
+def get_trade_from_noisy_mean_majority(z: Tensor) -> int:
+    trades = []
+    for row in z:
+        row_mean = torch.mean(row[:])
+        trade = 1 if row_mean > 0 else -1
+        trades.append(trade)
+    return 1 if sum(trades) > 0 else -1
+
+
+def get_trade_from_noisy_mean(z: Tensor) -> int:
+    z = z.mean(0)
+    res = torch.mean(z[:])  # first is weight, skip it and go from resp_1 to resp
+    return 1 if res > 0 else -1
 
 
 def visual_control_predict(
     model: torch.nn.Module,
     batch_size: int,
-    device: torch.DeviceObjType,
     df: pd.DataFrame,
 ):
     model.eval()
@@ -748,7 +819,7 @@ def visual_control_predict(
             FEATURE_STRING, ENCODED_FEATURES_COUNT - 1
         )
     ].values
-    model_input = model_input_from_row(row, batch_size, device)
+    model_input = model_input_from_row(row, batch_size)
     z = model(model_input)
     print("Model output")
     print(z[0])
@@ -788,9 +859,9 @@ def create_and_train_predict_model(
     model = get_core_model(
         ENCODED_FEATURES_COUNT,
         JaneStreetDatasetPredict.Y_LEN,
-        hidden_count=4,
+        hidden_count=5,
         dropout_p=0.2,
-        net_width=200,
+        net_width=2000,
     )
 
     model = model.float()
@@ -810,7 +881,6 @@ def create_and_train_predict_model(
     visual_control_predict(
         model,
         batch_size,
-        device,
         validation_sample,
     )
     return model
@@ -866,6 +936,7 @@ if JANE_STREET_SUBMISSION:
     predict_model.eval()
     print("models ready")
     env = janestreet.make_env()
+    print("janestreet env created")
     for (test_df, pred_df) in tqdm(env.iter_test()):
         test_df = add_time_columns_to_df(test_df, eval=True)
         if not test_df["weight"].item() > 0:
@@ -877,8 +948,12 @@ if JANE_STREET_SUBMISSION:
             JaneStreetEncode1Dataset.Y_START_COLUMN : JaneStreetEncode1Dataset.Y_END_COLUMN,
         ]
         row = row.iloc[0]
-        row = model_input_from_row(row.values, BATCH_SIZE, DEVICE)
-        z = predict_model(encoder_model.encoder(row))
-
-        pred_df.action = 1 if torch.mean(z[0][1:]) > 0.0 else 0
+        batch_of_rows = add_noise_to_model_input_tensor(
+            model_input_from_row(row.values, 21)
+        )
+        z = predict_model(encoder_model.encoder(batch_of_rows))
+        trade = get_trade_from_noisy_mean_majority(z)
+        if trade == -1:
+            trade = 0
+        pred_df.action = trade
         env.predict(pred_df)
