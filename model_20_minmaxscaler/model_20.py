@@ -48,7 +48,8 @@ USE_FINISHED_ENCODE = (
 LBFGS = False  # if True Broyden–Fletcher–Goldfarb–Shanno algorithm else Adam
 FLOAT_SIZE = "float64"
 WEIGHTED_RESPS = True  # if True - we are going to use responses multiplied by weight
-DATE_OVERFIT_FILL = None  # for providing also date informations - deprecated in the favor of the stability
+DATE_OVERFIT_FILL = None  # this setting is only good for overfitting the LB
+# - final dates are going to be detached from training ones
 
 try:
     if not USE_FINISHED_ENCODE:
@@ -69,6 +70,22 @@ last_min_max_scaler = None
 def get_file_size(filename: str) -> int:
     with open(filename) as f:
         return sum(1 for line in f)
+
+
+def preprocessing_scale_df(df: pd.DataFrame) -> pd.DataFrame:
+    global last_min_max_scaler
+    start_i = JaneStreetEncode1Dataset.Y_START_COLUMN
+    end_i = JaneStreetEncode1Dataset.Y_END_COLUMN
+    if not last_min_max_scaler:
+        last_min_max_scaler = MinMaxScaler()
+        df.loc[:, start_i:end_i] = last_min_max_scaler.fit_transform(
+            df.loc[:, start_i:end_i]
+        )
+    else:
+        df.loc[:, start_i:end_i] = last_min_max_scaler.transform(
+            df.loc[:, start_i:end_i]
+        )
+    return df
 
 
 def add_time_columns_to_df(df: pd.DataFrame, eval: bool = False) -> pd.DataFrame:
@@ -114,7 +131,8 @@ def get_df_from_source(
     )
     df = df.fillna(df.mean())
     df = df.astype(FLOAT_SIZE)
-    validation_size = int(df.shape[0] / 10)
+
+    validation_size = int(df.shape[0] / 5)
     if JANE_STREET_SUBMISSION:
         validation_size = int(validation_size / 5)
     print(df.shape)
@@ -137,7 +155,7 @@ def strip_for_batch_size(df: pd.DataFrame, batch_size: int) -> pd.DataFrame:
 
 class AddNoiseMixin:
     def init_dropout(self):
-        self.dropout_model = nn.Dropout(p=0.2)
+        self.dropout_model = nn.Dropout(p=0.15)
 
     @staticmethod
     def reverse_mask(mask: Tensor) -> Tensor:
@@ -183,10 +201,6 @@ class JaneStreetEncode1Dataset(AddDropoutNoiseMixin, Dataset):
         )
         return y
 
-    def init_dropout(self):
-        self.dropout_model = nn.Dropout(p=0.2)
-
-    # Constructor with defult values
     def __init__(
         self, df: pd.DataFrame, device: torch.DeviceObjType, transform: Callable = None
     ):
@@ -196,7 +210,6 @@ class JaneStreetEncode1Dataset(AddDropoutNoiseMixin, Dataset):
         self.transform = transform
         self.device = device
 
-    # Getter
     def __getitem__(self, index: int) -> Tuple[Tensor, Tensor, Tensor]:
         y = JaneStreetEncode1Dataset.get_y_from_df(self.df, index)
         assert len(y) == JaneStreetEncode1Dataset.Y_LEN
@@ -224,10 +237,10 @@ class autoencoder(nn.Module):
     def __init__(self, input_size: int, output_size: int, bottleneck: int):
         super(autoencoder, self).__init__()
         self.encoder = get_core_model(
-            input_size, bottleneck, 1, dropout_p=0.16, net_width=1500
+            input_size, bottleneck, 1, dropout_p=0.5, net_width=1500
         )
         self.decoder = get_core_model(
-            bottleneck, output_size, 1, dropout_p=0.16, net_width=1500
+            bottleneck, output_size, 1, dropout_p=0.5, net_width=1500
         )
 
     def forward(self, x: Tensor) -> Tensor:
@@ -278,7 +291,9 @@ def train_model_encoder(
 ) -> Tuple[dict, dict, np.ndarray, np.ndarray]:
     writer = SummaryWriter()
     criterion = EmphasizedSmoothL1Loss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    step = int(len(train_loader) / 4) * n_epoch
+    adam_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step, gamma=0.1)
     accuracy_list = {}
     loss_list = {}
     for epoch in range(n_epoch):
@@ -292,6 +307,7 @@ def train_model_encoder(
                 writer.add_scalar("Train data phase: {}".format(phase), loss, epoch)
             loss.backward()
             optimizer.step()
+            adam_scheduler.step()
             if not loss_list.get(epoch):
                 loss_list[epoch] = []
             loss_list[epoch].append(loss.data.tolist())
@@ -310,8 +326,6 @@ def train_model_encoder(
             accuracy_list[epoch].append(loss.data.tolist())
 
     model.eval()
-
-    # get encoded layer
 
     def build_encoded_layer(loader: torch.utils.data.DataLoader) -> np.ndarray:
         encoded_layer = []
@@ -471,10 +485,12 @@ def extract_model_input(
 def create_autencoder_and_train(
     batch_size: int = 200,
     effective_train_data: int = 1000000,
+    n_epoch: int = 3,
 ) -> torch.nn.Module:
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    df, n_epoch, validation_size = get_df_from_source(CSV_PATH, effective_train_data)
+    df, _n_epoch, validation_size = get_df_from_source(CSV_PATH, effective_train_data)
     df = add_time_columns_to_df(df)
+    df = preprocessing_scale_df(df)
     print("n_epoch {}".format(n_epoch))
     frac = 1 / 1
     train_sample = df.iloc[:-validation_size]
@@ -525,23 +541,10 @@ def create_autencoder_and_train(
 
 class JaneStreetDatasetPredict(Dataset):
 
-    Y_LEN = 2
+    Y_LEN = 5
 
     # Constructor with defult values
     def __init__(self, df, device, transform=None, batch_size=None):
-        """
-        df.insert(3, "trade", None)
-        df.loc[df["resp"] <= 0, "trade"] = 0
-        df.loc[df["resp"] > 0, "trade"] = 1
-        for one in range(4):
-            i = 4 - one
-            resp_str = "resp_{}".format(i)
-            trade_str = "trade_{}".format(i)
-            df.insert(3, trade_str, None)
-            df.loc[df[resp_str] <= 0, trade_str] = 0
-            df.loc[df[resp_str] > 0, trade_str] = 1
-        """
-
         self.df = df
         self.len = len(self.df)
         self.transform = transform
@@ -561,7 +564,7 @@ class JaneStreetDatasetPredict(Dataset):
             .float()
             .to(self.device)
         )
-        y = torch.tensor(self.df.iloc[index]["resp_4":"resp"]).float().to(self.device)
+        y = torch.tensor(self.df.iloc[index]["resp_1":"resp"]).float().to(self.device)
         assert len(y) == JaneStreetDatasetPredict.Y_LEN
 
         item = (x, y)
@@ -606,12 +609,15 @@ class CustomSmoothL1Loss(nn.SmoothL1Loss):
     this custom loss should make the learning behave partially like regression and partially like classification
     """
 
-    def forward(self, input: Tensor, target: Tensor) -> Tensor:
+    def forward(self, input: Tensor, target: Tensor, classification_weight=1) -> Tensor:
         target = torch.clone(target)
 
         distance = torch.abs(input - target)
         zero_pass_factor = torch.ones_like(distance)
-        zero_pass_factor[input * target < 0] = zero_pass_factor[input * target < 0] * 3
+        zero_pass_factor[input * target < 0] = (
+            zero_pass_factor[input * target < 0] * classification_weight
+        )
+        # zero_pass_factor[:, -1] = zero_pass_factor[:, -1] * 10
 
         distance[distance < 1] = torch.exp(distance[distance < 1])
         distance[distance > 1] = distance[distance > 1] + np.e - 1
@@ -635,23 +641,28 @@ def train_model_predict(
     writer = SummaryWriter()
     criterion = CustomSmoothL1Loss()
     if not LBFGS:
-        optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+        step = int(len(train_loader) / 4) * n_epoch
+        adam_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step, gamma=0.1)
     else:
         optimizer = torch.optim.LBFGS(
-            model.parameters(), max_iter=5, history_size=15, lr=0.01
+            model.parameters(), max_iter=15, history_size=60, lr=0.01
         )
     accuracy_list = {}
     loss_list = {}
-    scheduler_count = 0
     for epoch in range(n_epoch):
+        classification_weight = np.sqrt(
+            10 ** (n_epoch - epoch)
+        )  # if set to 1, CustomSmoothL1Loss will act as a pure regression
         print("Train predict model:")
         for x, y in tqdm(train_loader):
-            scheduler_count += 1
             model.train()
             if not LBFGS:
                 optimizer.zero_grad()
                 z = model(x.float())
-                loss = criterion(z, y.float())
+                loss = criterion(
+                    z, y.float(), classification_weight=classification_weight
+                )
                 if not JANE_STREET_SUBMISSION:
                     writer.add_scalar("Train data phase: {}".format(phase), loss, epoch)
                 loss.backward()
@@ -669,6 +680,7 @@ def train_model_predict(
                 optimizer.step(closure)
             else:
                 optimizer.step()
+                adam_scheduler.step()
 
             if LBFGS:
                 z = model(x.float())
@@ -681,12 +693,14 @@ def train_model_predict(
 
         # perform a prediction on the validation data
         accurate_guess = 0
+        accurate_guess_mean = 0
+        accurate_guess_mean_last3 = 0
         accurate_guess_from_random = 0
         accurate_guess_from_batch_noise_mean = 0
         accurate_guess_from_batch_noise_majority = 0
         accurate_guess_from_batch_noise_mean_majority = 0
 
-        total_count = 0
+        total_count = 1
 
         print("Validation predict model:")
         for x_test, y_test in tqdm(validation_loader):
@@ -700,11 +714,18 @@ def train_model_predict(
                     rand_choice = -1
                 if z[z_index][-1] * y_test[z_index][-1] > 0:
                     accurate_guess += 1
+                if torch.mean(z[z_index]) * y_test[z_index][-1] > 0:
+                    accurate_guess_mean += 1
+                if torch.mean(z[z_index][2:]) * y_test[z_index][-1] > 0:
+                    accurate_guess_mean_last3 += 1
                 if z[z_index][-1] * rand_choice > 0:
                     accurate_guess_from_random += 1
 
+                """
+                bagging attempts:
+
                 noisy_x_test = add_noise_to_model_input_tensor(
-                    batchify_to_tensor(x_test[z_index], 3)
+                    batchify_to_tensor(x_test[z_index], 11)
                 )
                 noisy_z = model(noisy_x_test.float())
                 trade = get_trade_from_noisy_mean(noisy_z)
@@ -718,8 +739,11 @@ def train_model_predict(
                 trade = get_trade_from_noisy_mean_majority(noisy_z)
                 if trade * y_test[z_index][-1] > 0:
                     accurate_guess_from_batch_noise_mean_majority += 1
+                """
 
-            loss = criterion(z, y_test.float())
+            loss = criterion(
+                z, y_test.float(), classification_weight=classification_weight
+            )
             if not JANE_STREET_SUBMISSION:
                 writer.add_scalar(
                     "Validation data phase: {}".format(phase), loss, epoch
@@ -728,6 +752,16 @@ def train_model_predict(
                 accuracy_list[epoch] = []
             accuracy_list[epoch].append(loss.data.tolist())
         print("epoch_{} accuracy: {}".format(epoch, accurate_guess / total_count))
+        print(
+            "epoch_{} accuracy mean: {}".format(
+                epoch, accurate_guess_mean / total_count
+            )
+        )
+        print(
+            "epoch_{} accuracy mean last3: {}".format(
+                epoch, accurate_guess_mean_last3 / total_count
+            )
+        )
         print(
             "epoch_{} accuracy from random choice: {}".format(
                 epoch, accurate_guess_from_random / total_count
@@ -864,8 +898,8 @@ def create_and_train_predict_model(
         ENCODED_FEATURES_COUNT,
         JaneStreetDatasetPredict.Y_LEN,
         hidden_count=3,
-        dropout_p=0.4,
-        net_width=1000,
+        dropout_p=0.5,
+        net_width=1500,
     )
 
     model = model.float()
@@ -898,12 +932,14 @@ def main(
         encoder_model = create_autencoder_and_train(
             batch_size=batch_size,
             effective_train_data=effective_train_data,
+            n_epoch=2,
         )
 
         df, n_epoch, validation_size = get_df_from_source(
             CSV_PATH, effective_train_data
         )
         df = add_time_columns_to_df(df)
+        df = preprocessing_scale_df(df)
         df = strip_for_batch_size(df, batch_size)
         extract_model_input(
             df,
@@ -919,7 +955,7 @@ def main(
         df,
         validation_size=validation_size,
         batch_size=batch_size,
-        n_epoch=5,
+        n_epoch=4,
     )
     print("Done")
     if JANE_STREET_SUBMISSION:
@@ -943,10 +979,12 @@ if JANE_STREET_SUBMISSION:
     print("janestreet env created")
     for (test_df, pred_df) in tqdm(env.iter_test()):
         test_df = add_time_columns_to_df(test_df, eval=True)
+        test_df = preprocessing_scale_df(test_df)
         if not test_df["weight"].item() > 0:
             pred_df.action = 0
             env.predict(pred_df)
             continue
+
         row = test_df.loc[
             :,
             JaneStreetEncode1Dataset.Y_START_COLUMN : JaneStreetEncode1Dataset.Y_END_COLUMN,
@@ -954,5 +992,7 @@ if JANE_STREET_SUBMISSION:
         row = row.iloc[0]
         batch_of_rows = model_input_from_row(row.values, 1)
         z = predict_model(encoder_model.encoder(batch_of_rows))
-        pred_df.action = 1 if z[0][1] >= 0 else 0
+        term = torch.mean(z[0])
+        pred_df.action = 1 if term >= 0 else 0
+
         env.predict(pred_df)
