@@ -38,11 +38,17 @@ if JANE_STREET_SUBMISSION:
             print(os.path.join(dirname, filename))
     CSV_PATH = "/kaggle/input/jane-street-market-prediction/train.csv"
 else:
-    CSV_PATH = "/home/vaclavmatejka/devel/janestreet/jane-street-market-prediction/pybindataset.hdf"
+    CSV_PATH_ORIGINAL_COLUMNS = "/home/vaclavmatejka/devel/janestreet/jane-street-market-prediction/pybindataset.hdf"
+    CSV_PATH = (
+        "/home/vaclavmatejka/devel/janestreet/jane-street-market-prediction/mar15.hdf"
+    )
+    CSV_PATH = (
+        "/home/vaclavmatejka/devel/janestreet/jane-street-market-prediction/pybindataset.hdf"
+    )
 
 ENCODED_CSV = "encoded.csv"
 USE_FINISHED_ENCODE = (
-    True  # if True run just prediction model and use the old ENCODED_CSV file
+    False  # if True run just prediction model and use the old ENCODED_CSV file
 )
 LBFGS = False  # if True Broyden–Fletcher–Goldfarb–Shanno algorithm else Adam
 FLOAT_SIZE = "float64"
@@ -58,38 +64,79 @@ except FileNotFoundError:
 # assert torch.cuda.is_available()
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print(DEVICE)
-ENCODED_FEATURES_COUNT = 400
+ENCODED_FEATURES_COUNT = 60
 FEATURE_STRING = "enc_feature_"
 
-resp_start = "trade_in_3h_ETHBUSD_open_price"
-resp_end = "trade_in_1h_BTCBUSD_open_price"
+RESP_START = "trade_in_3h_ETHBUSD_open_price"
+RESP_END = "trade_in_1h_BTCBUSD_open_price"
+HINGELIKE_MULTIPLY_TRANSFORM_VAL = 20
+HINGELIKE_ADD_TRANSFORM_VAL = 2.5
 
 last_min_max_scaler = None
+
+
+def transform_back_from_hingelike(val):
+    if val > 0:
+        val = val - HINGELIKE_ADD_TRANSFORM_VAL
+        val = val / HINGELIKE_MULTIPLY_TRANSFORM_VAL
+    if val < 0:
+        val = val + HINGELIKE_ADD_TRANSFORM_VAL
+        val = val / HINGELIKE_MULTIPLY_TRANSFORM_VAL
+    return val
 
 
 def simulate_trade_omax_2h(model_output, actual_output, amount=400000, rake=0.00075):
     rake = 0.00018
     single_curr = []
+    single_curr_min = []
     single_curr_mean_max = -100
     single_curr_mean_max_index = 0
+    single_curr_mean_min = 100
+    single_curr_mean_min_index = 0
     for one in range(len(model_output)):
         val = float(model_output[one])
         single_curr.append(val)
+        single_curr_min.append(val)
         if len(single_curr) == 3:
-            single_curr_mean = np.mean(single_curr)
-            if single_curr_mean > single_curr_mean_max:
-                single_curr_mean_max = single_curr_mean
+            single_curr_mean_high = np.mean(single_curr)
+            single_curr_mean_low = np.mean(single_curr_min)
+            if single_curr_mean_high > single_curr_mean_max:
+                single_curr_mean_max = single_curr_mean_high
                 single_curr_mean_max_index = one - 1
+            if single_curr_mean_low < single_curr_mean_min:
+                single_curr_mean_min = single_curr_mean_low
+                single_curr_mean_min_index = one - 1
 
             single_curr = []
+            single_curr_min = []
     trade_amount = amount - (amount * rake)
     did_the_trade = 0
     new_amount = amount
 
-    if single_curr_mean_max > 0.005:
+    hingelike_val = actual_output[single_curr_mean_max_index]
+    val = transform_back_from_hingelike(hingelike_val)
+
+    model_hingelike_val = model_output[single_curr_mean_max_index]
+    model_val = transform_back_from_hingelike(model_hingelike_val)
+
+    short = False
+    if single_curr_mean_max < abs(single_curr_mean_min) and single_curr_mean_min < 0:
+        short = True
+        hingelike_val = actual_output[single_curr_mean_min_index]
+        val = transform_back_from_hingelike(hingelike_val)
+        model_hingelike_val = model_output[single_curr_mean_min_index]
+        model_val = transform_back_from_hingelike(model_hingelike_val)
+
+    if max(single_curr_mean_max, abs(single_curr_mean_min)) > 0.1:
         did_the_trade = 1
-        val = actual_output[single_curr_mean_max_index]
-        new_amount = trade_amount * (1 + val)
+        profit = False
+        if val * model_val > 0:
+            profit = True
+
+        if profit:
+            new_amount = trade_amount * (1 + abs(val))
+        else:
+            new_amount = trade_amount * (1 - abs(val))
         new_amount = new_amount - (new_amount * rake)  # we will convert it back
 
     return new_amount, did_the_trade
@@ -116,12 +163,24 @@ def preprocessing_scale_df(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def transform_resps_to_05_05_hingelike(df):
+    df1 = df.loc[:, RESP_START:RESP_END]
+    df1 = df1 * HINGELIKE_MULTIPLY_TRANSFORM_VAL
+    df1[df1 > 0] = df1[df1 > 0] + HINGELIKE_ADD_TRANSFORM_VAL
+    df1[df1 < 0] = df1[df1 < 0] - HINGELIKE_ADD_TRANSFORM_VAL
+    df.loc[:, RESP_START:RESP_END] = df1
+    return df
+
+
 def get_df_from_source() -> (pd.DataFrame, int, int):
+    df_orig = pd.read_hdf(CSV_PATH_ORIGINAL_COLUMNS)
     df = pd.read_hdf(CSV_PATH)
+    df = df.reindex(df_orig.columns, axis=1)
     df = df.astype(FLOAT_SIZE)
     df = df.replace([np.inf, -np.inf], np.nan)
     df = df.fillna(0)
     df = df.reset_index(drop=True)
+    df = transform_resps_to_05_05_hingelike(df)
     validation_size = int(df.shape[0] / 5)
     return df, validation_size
 
@@ -226,10 +285,10 @@ class autoencoder(nn.Module):
     def __init__(self, input_size: int, output_size: int, bottleneck: int):
         super(autoencoder, self).__init__()
         self.encoder = get_core_model(
-            input_size, bottleneck, 1, dropout_p=0.5, net_width=800
+            input_size, bottleneck, 1, dropout_p=0.2, net_width=400
         )
         self.decoder = get_core_model(
-            bottleneck, output_size, 1, dropout_p=0.5, net_width=800
+            bottleneck, output_size, 1, dropout_p=0.2, net_width=400
         )
 
     def forward(self, x: Tensor) -> Tensor:
@@ -280,7 +339,8 @@ def train_model_encoder(
 ) -> Tuple[dict, dict, np.ndarray, np.ndarray]:
     writer = SummaryWriter()
     criterion = EmphasizedSmoothL1Loss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05, momentum=0.01)
     step = int(len(train_loader) / 4) * n_epoch
     adam_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step, gamma=0.25)
     accuracy_list = {}
@@ -296,7 +356,7 @@ def train_model_encoder(
                 writer.add_scalar("Train data phase: {}".format(phase), loss, epoch)
             loss.backward()
             optimizer.step()
-            adam_scheduler.step()
+            # adam_scheduler.step()
             if not loss_list.get(epoch):
                 loss_list[epoch] = []
             loss_list[epoch].append(loss.data.tolist())
@@ -356,7 +416,7 @@ def extract_model_input(
     encoded_features_count: int = 50,
 ) -> None:
 
-    base_columns = list(df.loc[:, resp_start:resp_end].columns)
+    base_columns = list(df.loc[:, RESP_START:RESP_END].columns)
     original_columns = list(
         df.loc[
             :,
@@ -549,7 +609,7 @@ class JaneStreetDatasetPredict(Dataset):
             .to(self.device)
         )
         y = (
-            torch.tensor(self.df.iloc[index][resp_start:resp_end])
+            torch.tensor(self.df.iloc[index][RESP_START:RESP_END])
             .float()
             .to(self.device)
         )
@@ -592,33 +652,6 @@ def get_core_model(
     return torch.nn.Sequential(*layers)
 
 
-class CustomSmoothL1Loss(nn.SmoothL1Loss):
-    """
-    this custom loss should make the learning behave partially like regression and partially like classification
-    """
-
-    def forward(self, input: Tensor, target: Tensor, classification_weight=1) -> Tensor:
-        target = torch.clone(target)
-
-        distance = torch.abs(input - target)
-        zero_pass_factor = torch.ones_like(distance)
-        zero_pass_factor[input * target < 0] = (
-            zero_pass_factor[input * target < 0] * classification_weight
-        )
-        # zero_pass_factor[:, -1] = zero_pass_factor[:, -1] * 10
-
-        distance[distance < 1] = torch.exp(distance[distance < 1])
-        distance[distance > 1] = distance[distance > 1] + np.e - 1
-        distance = distance * zero_pass_factor
-        distance = distance.float()
-
-        target[input > target] = input[input > target] - distance[input > target]
-        target[input < target] = input[input < target] + distance[input < target]
-
-        ret = super().forward(input, target)
-        return ret
-
-
 def train_model_predict(
     model: torch.nn.Module,
     train_loader: torch.utils.data.DataLoader,
@@ -627,9 +660,10 @@ def train_model_predict(
     phase: int = None,
 ) -> Tuple[dict, dict, bool]:
     writer = SummaryWriter()
-    criterion = CustomSmoothL1Loss()
+    criterion = nn.SmoothL1Loss()
     if not LBFGS:
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
         step = int(len(train_loader) / 4) * n_epoch
         adam_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step, gamma=0.1)
     else:
@@ -640,30 +674,13 @@ def train_model_predict(
     loss_list = {}
     bank_profits = []
     for epoch in range(n_epoch):
-        if epoch == 0:
-            classification_weight = 12
-        elif epoch == 1:
-            classification_weight = 10
-        elif epoch == 2:
-            classification_weight = 8
-        elif epoch == 3:
-            classification_weight = 6
-        elif epoch == 4:
-            classification_weight = 4
-        else:
-            classification_weight = 2
-        classification_weight = 3
-        print(classification_weight)
-        # if set to 1, CustomSmoothL1Loss will act as a pure regression
         print("Train predict model:")
         for x, y in tqdm(train_loader):
             model.train()
             if not LBFGS:
                 optimizer.zero_grad()
                 z = model(x.float())
-                loss = criterion(
-                    z, y.float(), classification_weight=classification_weight
-                )
+                loss = criterion(z, y.float())
                 if not JANE_STREET_SUBMISSION:
                     writer.add_scalar("Train data phase: {}".format(phase), loss, epoch)
                 loss.backward()
@@ -681,7 +698,7 @@ def train_model_predict(
                 optimizer.step(closure)
             else:
                 optimizer.step()
-                adam_scheduler.step()
+                # adam_scheduler.step()
 
             if LBFGS:
                 z = model(x.float())
@@ -785,9 +802,7 @@ def train_model_predict(
                     z[z_index]
                 )
 
-            loss = criterion(
-                z, y_test.float(), classification_weight=classification_weight
-            )
+            loss = criterion(z, y_test.float())
             if not JANE_STREET_SUBMISSION:
                 writer.add_scalar(
                     "Validation data phase: {}".format(phase), loss, epoch
@@ -930,7 +945,7 @@ def train_model_predict(
     profit_test_passed = True
     last_third_bank_profits = bank_profits[int(len(bank_profits) / 4) * 3 :]
     for bank_profit in last_third_bank_profits:
-        if bank_profit < initial_bank:
+        if bank_profit < initial_bank * 0.75:
             profit_test_passed = False
     print("Profit test passed: {}".format(profit_test_passed))
     print(
@@ -1015,7 +1030,7 @@ def visual_control_predict(
     print("Model output")
     print(z[0])
     print("actual_data")
-    print(df.iloc[index][resp_start:resp_end])
+    print(df.iloc[index][RESP_START:RESP_END])
 
 
 def create_and_train_predict_model(
@@ -1050,9 +1065,9 @@ def create_and_train_predict_model(
     model = get_core_model(
         ENCODED_FEATURES_COUNT,
         JaneStreetDatasetPredict.Y_LEN,
-        hidden_count=3,
-        dropout_p=0.5,
-        net_width=600,
+        hidden_count=2,
+        dropout_p=0.15,
+        net_width=80,
     )
 
     model = model.float()
@@ -1085,14 +1100,14 @@ def create_and_train_predict_model(
 
 
 def main(
-    batch_size=500,
+    batch_size=200,
     effective_train_data=1000000,
 ):
     if not USE_FINISHED_ENCODE:
         encoder_model = create_autencoder_and_train(
             batch_size=batch_size,
             effective_train_data=effective_train_data,
-            n_epoch=20,
+            n_epoch=30,
         )
 
         df, validation_size = get_df_from_source()
@@ -1112,7 +1127,7 @@ def main(
         df,
         validation_size=validation_size,
         batch_size=batch_size,
-        n_epoch=20,
+        n_epoch=16,
     )
     print("Done")
     if JANE_STREET_SUBMISSION:
